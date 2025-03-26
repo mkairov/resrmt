@@ -401,8 +401,9 @@ class Trainer:
             self.accelerator.clip_grad_value_(params, self.args.clip_grad_value)
             grad_norm = self._get_gradients_global_norm()
         elif self.args.clip_grad_norm:
-            grad_norm = self.accelerator.clip_grad_norm_(params, self.args.clip_grad_norm)
+            grad_norm = self.model._global_grad_norm
             grad_norm = grad_norm.item() if grad_norm is not None else 0.0
+            self.accelerator.clip_grad_norm_(params, self.args.clip_grad_norm)
         return grad_norm
 
     def _get_gradients_global_norm(self):
@@ -730,7 +731,7 @@ class Trainer:
             logger.info(f'Loading model from {load_path}')
             checkpoint = torch.load(load_path / 'model.pth', map_location='cpu', weights_only=False)
             # checkpoint = safetensors.torch.load_file(load_path / 'model.safetensors', device='cpu')
-            missing_k, unexpected_k = self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint.state_dict(), strict=False)
+            missing_k, unexpected_k = self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint, strict=False)
             if len(missing_k) != 0:
                 logger.info(f'{missing_k} were not loaded from checkpoint! These parameters were randomly initialized.')
             if len(unexpected_k) != 0:
@@ -768,8 +769,11 @@ class Trainer:
                     'epoch': self.n_epoch,
                     'metrics': self.metrics
                 }
-                unwrapped_model = self.accelerator.unwrap_model(self.model)
-                torch.save(unwrapped_model, f'{save_path}/model.pth')
+                # unwrapped_model = self.accelerator.unwrap_model(self.model)
+                # torch.save(unwrapped_model.state_dict(), f'{save_path}/model.pth')
+                state_dict = self.accelerator.get_state_dict(self.model)
+                torch.save(state_dict, f'{save_path}/model.pth')
+
                 # unwrapped_model.save(f'{save_path}/model.pth', save_function=self.accelerator.save)
                 # handled by accelerate
                 # if self.use_torch_amp:

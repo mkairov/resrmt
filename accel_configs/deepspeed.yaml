@@ -1,7 +1,7 @@
 compute_environment: LOCAL_MACHINE
 main_process_port: null
 deepspeed_config:
-  zero_stage: 2
+  zero_stage: 1
   gradient_accumulation_steps: 1
   gradient_clipping: 1.0
   offload_optimizer_device: none

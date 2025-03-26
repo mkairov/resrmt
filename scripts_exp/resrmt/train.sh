@@ -17,7 +17,8 @@ POSTFIX=teacher-forcing
 # POSTFIX=gen-valid
 OVERWRITE_RUNS=1
 
-# for MODEL_KIND in rmt resrmt; do
+# for LAST_ARG in "" "--sep_seg_q"; do
+
 for MODEL_KIND in rmt-br; do
 
 if [ $MODEL_KIND = "rmt" ]; then
@@ -34,14 +35,16 @@ elif [ $MODEL_KIND = "rmt-br" ]; then
     MEMORY_CELL=modeling_rmt.rmt_br:MemoryCell
     RECURRENT_WRAPPER=modeling_rmt.rmt_br:RecurrentWrapper
 else
+    echo Model $MODEL_KIND not found, aborting
     exit 1
 fi
 
 MODEL_NAME=gpt2  # backbone model
     
-ITERS=10000
+ITERS=25000
 
 for TASK_DATASET in qa1_single-supporting-fact; do
+# for TASK_DATASET in qa2_two-supporting-facts; do
 # for TASK_DATASET in qa3_three-supporting-facts; do
 # for TASK_DATASET in qa4_two-arg-relations; do
 
@@ -49,10 +52,10 @@ for TASK_DATASET in qa1_single-supporting-fact; do
 
 for LR in 1e-05; do
 
-TBS=6
-for SEGMENT_SIZE in 512; do
-MAX_N_SEGMENTSS=(0 0 6)
-BSS=(0 0 1)
+TBS=64
+for SEGMENT_SIZE in 128; do
+MAX_N_SEGMENTSS=(0 1 3)
+BSS=(0 16 8)
 
 for (( j=2; j<${#MAX_N_SEGMENTSS[@]}; j++ )); do
 
@@ -77,21 +80,20 @@ SCHEDULER=linear
 
 for RES_MEM_COUNT in -1; do
 
-for N in sep_q2; do
+for N in freeze; do
 
 K2=-1 # BPTT unroll length
 
 NP=$NP  
-ACCEL_CONFIG=/data/home/admin/rmt/accel_configs/exp/accelerate/${MODEL_KIND}_bf16_tbs${TBS}g${GRAD_ACC_STEPS}c1.0np${NP}.yaml
+ACCEL_CONFIG=/data/home/admin/rmt/accel_configs/exp/accelerate/deepspeed_bf16_tbs${TBS}bs${BS}g${GRAD_ACC_STEPS}c1.0np${NP}.yaml
 cd accel_configs/
-python create_config.py \
+python create_config2.py \
         --bf16 \
-        --train_batch_size $TBS\
-        --train_micro_batch_size_per_gpu $BS\
-        --gradient_accumulation_steps $GRAD_ACC_STEPS\
-        --np $NP\
-        --gradient_clipping 1.0\
-        --prefix $MODEL_KIND
+        --train_batch_size $TBS \
+        --train_micro_batch_size_per_gpu $BS \
+        --gradient_accumulation_steps $GRAD_ACC_STEPS \
+        --np $NP \
+        --gradient_clipping 1.0
 cd ..
 
 MODEL_PATH="/data/home/admin/rmt/runs/${TASK_DATASET}/${MODEL_NAME}/${MODEL_KIND}/${SCHEDULER}_adamw_wd1e-03_${MAX_N_SEGMENTS}x${SEGMENT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_bptt-${K2}_from_cpt_${SRC_N_SEGMENTS}-${MAX_N_SEGMENTS}_${POSTFIX}/run_${N}"
@@ -143,8 +145,7 @@ accelerate launch --config_file $ACCEL_CONFIG --main_process_port 29007 run_fine
         --optimize_metric $METRIC --optimize_mode max --best_metric_value 1.0 \
         --show_valid_examples 5 \
         --seed $(($N+42)) \
-        --clip_grad_norm 1.0 --max_n_facts 50 --sep_seg_q
-
+        --clip_grad_norm 1.0 --max_n_facts 50 --early_stopping_patience 25 --aggr_type full --freeze_model_weights
 else
 
 echo run $MODEL_PATH exists already, delete the previous run or ser OVERWRITE_RUNS to 0
@@ -162,5 +163,6 @@ done
 done
 done
 done
+# done
 
 echo done

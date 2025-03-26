@@ -1,14 +1,17 @@
 import math
-import torch
-from torch.nn import CrossEntropyLoss
-from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 import random
+
+import torch
+from torch import nn
+
+from lm_experiments_tools.utils import RMTOutput
 
 
 class MemoryCell(torch.nn.Module):
-    def __init__(self, base_model, num_mem_tokens):
+    def __init__(self, base_model, num_mem_tokens, **kwargs):
         super().__init__()
         self.model = base_model
+        self.num_mem_tokens = num_mem_tokens
         self.create_memory(num_mem_tokens)
 
     def create_memory(self, num_mem_tokens):
@@ -73,7 +76,7 @@ class MemoryCell(torch.nn.Module):
     
     def process_output(self, model_outputs, **kwargs):
         if self.num_mem_tokens not in {0, None}:
-            out = CausalLMOutputWithCrossAttentions()
+            out = RMTOutput()
             memory_state = model_outputs.hidden_states[-1][:, -self.num_mem_tokens:]
             out['logits'] = model_outputs.logits[:, self.num_mem_tokens:-self.num_mem_tokens]
             
@@ -88,35 +91,14 @@ class MemoryCell(torch.nn.Module):
         return out, memory_state 
 
 
-class MemoryAggregator(torch.nn.Module):
-    def __init__(self, memory_dim, hidden_dim=None):
-        super().__init__()
-
-        if hidden_dim is None:
-            hidden_dim = memory_dim
-
-        self.aggr1 = torch.nn.Linear(2 * memory_dim, hidden_dim, bias=False)
-        self.activation = torch.nn.ReLU()
-        self.aggr2 = torch.nn.Linear(hidden_dim, memory_dim, bias=False)
-        self.norm = torch.nn.LayerNorm(memory_dim)
-    
-    def forward(self, prev_memory, current_memory):
-        combined_memory = torch.cat([prev_memory, current_memory], dim=-1)
-        updated_memory = self.aggr1(combined_memory)
-        updated_memory = self.activation(updated_memory)
-        updated_memory = self.aggr2(updated_memory)
-        updated_memory = self.norm(updated_memory)
-        return updated_memory
-
-
 class MemoryAttention(torch.nn.Module):
-    def __init__(self, memory_dim, residual_memory_count=None, hidden_dim=None, num_heads=1):
+    def __init__(self, memory_dim, res_mem_count, hidden_dim=None, num_heads=1, embd_std=0.02):
         super().__init__()
         if hidden_dim is None:
             hidden_dim = memory_dim * 4
 
         self.memory_dim = memory_dim
-        self.residual_memory_count = residual_memory_count
+        self.res_mem_count = res_mem_count
         self.attention = torch.nn.MultiheadAttention(embed_dim=memory_dim, num_heads=num_heads, batch_first=True)
         self.feedforward = torch.nn.Sequential(
             torch.nn.Linear(memory_dim, hidden_dim),
@@ -126,14 +108,26 @@ class MemoryAttention(torch.nn.Module):
         self.norm1 = torch.nn.LayerNorm(memory_dim)
         self.norm2 = torch.nn.LayerNorm(memory_dim)
 
+        self._init_weights(embd_std)
+
+    def _init_weights(self, embd_std):
+        for n, p in self.named_parameters():
+            if "weight" in n:
+                if "attention" in n:
+                    nn.init.normal_(p, mean=0.0, std=embd_std)
+                elif "norm" in n:
+                    nn.init.ones_(p)
+                else:
+                    nn.init.xavier_uniform_(p)
+            elif "bias" in n:
+                nn.init.zeros_(p)
+
     def forward(self, current_memory, prev_memories):
-        if len(prev_memories) == 0 or self.residual_memory_count == 0:
-            # if return_attention_map:
-            #     return current_memory, None
+        if len(prev_memories) == 0 or self.res_mem_count == 0:
             return current_memory
         
-        elif self.residual_memory_count > 0:
-            memory_dropout = random.sample(prev_memories, min(len(prev_memories), self.residual_memory_count))
+        elif self.res_mem_count > 0:
+            memory_dropout = random.sample(prev_memories, min(len(prev_memories), self.res_mem_count))
             memory_cat = torch.cat(memory_dropout, dim=1)
             attn_output, attn_map = self.attention(query=current_memory, key=memory_cat, value=memory_cat) # K [memory_dim, n_tokens * n_memory] @ V^T
 
@@ -146,9 +140,7 @@ class MemoryAttention(torch.nn.Module):
         updated_memory = updated_memory + self.feedforward(updated_memory)
         updated_memory = self.norm2(updated_memory)
 
-        # if return_attention_map:
-        return updated_memory, attn_map
-        # return updated_memory
+        return updated_memory
 
 
 def apply_rope_with_segments(memory_state, segment_num):
@@ -176,47 +168,41 @@ class RecurrentWrapper(torch.nn.Module):
         self.rmt_config = rmt_kwargs
 
         memory_dim = self.memory_cell.memory.shape[-1]
-        self.memory_aggregator = MemoryAttention(memory_dim, rmt_kwargs.get('residual_memory_count'))
 
-    def forward(self, input_ids, labels=None, labels_mask=None, inputs_embeds=None, attention_mask=None, output_attentions=False, output_hidden_states=True, output_aggr_attentions=False):
+        self.res_mem_count = rmt_kwargs.get("res_mem_count")
+        if self.res_mem_count not in {0, None}:
+            self.memory_aggregator = MemoryAttention(memory_dim, res_mem_count=rmt_kwargs.get('res_mem_count'))
+        else:
+            self.aggregator = None
+
+    def forward(self, input_ids, labels=None, labels_mask=None, inputs_embeds=None, attention_mask=None, output_attentions=False, output_hidden_states=True):
         memory_state = None
         segmented = self.segment(input_ids=input_ids, inputs_embeds=inputs_embeds, attention_mask=attention_mask)
 
         cell_outputs = []
         past_memory_states = []
-        memory_attn_outputs = []
         for seg_num, segment in enumerate(segmented):
             cell_out, memory_state = self.memory_cell(**segment, memory_state=memory_state, output_hidden_states=output_hidden_states, output_attentions=output_attentions)
             cell_outputs.append(cell_out)
 
-            # apply memory aggregation
-            if len(segmented) > 1:
-                # memory_state = apply_rope_with_segments(memory_state, seg_num)
-                past_memory_states.append(apply_rope_with_segments(memory_state, seg_num))
-                memory_state = self.memory_aggregator(memory_state, past_memory_states)
-                # if output_aggr_attentions:
-                memory_state, memory_attn = memory_state
-                memory_attn_outputs.append(memory_attn)
+            if self.memory_cell.num_mem_tokens > 0 and self.aggregator is not None:
+                memory_pos_embeds = apply_rope_with_segments(memory_state, seg_num).type_as(memory_state)
+                past_memory_states.append(memory_pos_embeds)
+                memory_state = self.aggregator(memory_pos_embeds, past_memory_states)
                 memory_state = self.manage_gradients(memory_state, seg_num)
 
-        past_memory_states.clear()
-
-
-        out, _ = self.process_outputs(cell_outputs, labels=labels, 
+        out = self.process_outputs(cell_outputs, labels=labels, 
                                    labels_mask=labels_mask,
                                    output_attentions=output_attentions, 
-                                   output_hidden_states=output_hidden_states,
-                                   memory_attn_outputs=memory_attn_outputs)
-                                   
-        if output_aggr_attentions:
-            return out, memory_attn_outputs
+                                   output_hidden_states=output_hidden_states)
+        past_memory_states.clear()
+        
         return out
     
     def generate(self, input_ids, attention_mask=None, **generate_kwargs):
         memory_state = None
         segmented = self.segment(input_ids=input_ids, attention_mask=attention_mask)
 
-        # print('\n\n\nGenerate: ', [s['input_ids'].shape for s in segmented])
         past_memory_states = []
         for seg_num, segment in enumerate(segmented[:-1]):
             _, memory_state = self.memory_cell(**segment, memory_state=memory_state, output_hidden_states=True)
@@ -260,7 +246,7 @@ class RecurrentWrapper(torch.nn.Module):
         return segments
 
     def process_outputs(self, cell_outputs, **kwargs):
-        out = CausalLMOutputWithCrossAttentions()
+        out = RMTOutput()
         full_logits = torch.cat([o.logits for o in cell_outputs], dim=1)
         full_hidden_states = tuple([torch.cat(layer_hs, dim=1) for layer_hs in zip(*[o.hidden_states for o in cell_outputs])])
 
@@ -271,7 +257,7 @@ class RecurrentWrapper(torch.nn.Module):
             flat_labels = shift_labels.view(-1)
             flat_logits = shift_logits.view(-1, shift_logits.size(-1))
             
-            loss_fct = CrossEntropyLoss()
+            loss_fct = nn.CrossEntropyLoss()
             labels_mask = kwargs.get('labels_mask')
             if labels_mask is not None:
                 shift_mask = labels_mask[..., :-1].contiguous()
@@ -288,22 +274,15 @@ class RecurrentWrapper(torch.nn.Module):
         out['logits'] = full_logits
         segment_keys = ['loss', 'logits']
         if kwargs.get('output_attentions'):
-            print('skubudu bap?')
             segment_keys.append('attentions')
         if kwargs.get('output_hidden_states'):
             segment_keys.append('hidden_states')
             out['hidden_states'] = full_hidden_states
-        # if len(kwargs.get('memory_attn_outputs', [])) > 0:
-        #     print('skibidi dop!')
-        #     out['memory_attn_outputs'] = kwargs.get('memory_attn_outpus')
 
         for seg_num, o in enumerate(cell_outputs):
             for key, value in o.items():
                 if any([sk in key for sk in segment_keys]):
                     out[f'{key}_{seg_num}'] = value
-
-        if kwargs.get('memory_attn_outputs', False):
-            return out, kwargs.get('memory_attn_outputs')
 
         return out 
         

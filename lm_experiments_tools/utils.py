@@ -255,3 +255,11 @@ class RMTOutput(ModelOutput):
     attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
     cross_attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
     memory_states: Optional[list[torch.FloatTensor, ...]] = None
+
+
+class DummyAttentionOutput:
+    def __init__(self, data):
+        self.data = data
+    
+    def split(self, *args, **kwargs):
+        return self.data

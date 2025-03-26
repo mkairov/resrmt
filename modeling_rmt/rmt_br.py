@@ -1,14 +1,15 @@
+import copy
 import math
 import random
 
 import torch
 from torch import nn
 
-from lm_experiments_tools.utils import RMTOutput
+from lm_experiments_tools.utils import RMTOutput, DummyAttentionOutput
 
 
 class MemoryAttention(torch.nn.Module):
-    def __init__(self, memory_dim, res_mem_count, hidden_dim=None, num_heads=1):
+    def __init__(self, memory_dim, res_mem_count, hidden_dim=None, num_heads=1, embd_std=0.02):
         super().__init__()
         if hidden_dim is None:
             hidden_dim = memory_dim * 4
@@ -24,10 +25,22 @@ class MemoryAttention(torch.nn.Module):
         self.norm1 = torch.nn.LayerNorm(memory_dim)
         self.norm2 = torch.nn.LayerNorm(memory_dim)
 
+        self._init_weights(embd_std)
+
+    def _init_weights(self, embd_std):
+        for n, p in self.named_parameters():
+            if "weight" in n:
+                if "attention" in n:
+                    nn.init.normal_(p, mean=0.0, std=embd_std)
+                elif "norm" in n:
+                    nn.init.ones_(p)
+                else:
+                    nn.init.xavier_uniform_(p)
+            elif "bias" in n:
+                nn.init.zeros_(p)
+
     def forward(self, current_memory, prev_memories):
         if len(prev_memories) == 0 or self.res_mem_count == 0:
-            # if return_attention_map:
-            #     return current_memory, None
             return current_memory
         
         elif self.res_mem_count > 0:
@@ -44,9 +57,66 @@ class MemoryAttention(torch.nn.Module):
         updated_memory = updated_memory + self.feedforward(updated_memory)
         updated_memory = self.norm2(updated_memory)
 
-        # if return_attention_map:
         return updated_memory
-        # return updated_memory
+
+
+class KVCacheHook:
+    def __init__(self, d_model):
+        self.d_model = d_model
+        self.cached_k = None
+        self.cached_v = None
+
+    def hook_fn(self, module, inputs, output):
+        d_model = self.d_model
+        q, k, v = output.split(d_model, dim=-1)
+        if self.cached_k is None or self.cached_v is None:
+            self.cached_k = k
+            self.cached_v = v
+        else:
+            self.cached_k = torch.cat([self.cached_k, k], dim=1)
+            self.cached_v = torch.cat([self.cached_v, v], dim=1)
+        
+        return DummyAttentionOutput(data=(q, self.cached_k, self.cached_v))
+    
+    def clear_cache(self):
+        self.cached_k = None
+        self.cached_v = None
+
+
+class GPTMemoryAttention(torch.nn.Module):
+    def __init__(self, layer, d_model, res_mem_count=-1, c_attn_attr: str = 'attn.c_attn'):
+        super().__init__()
+        self.layer = copy.deepcopy(layer)
+        self.res_mem_count = res_mem_count
+
+        if c_attn_attr is not None:
+            self.c_attn_attrs = c_attn_attr.split('.')
+            self.c_attn = self.layer
+            for i, attr in enumerate(self.c_attn_attrs):
+                self.c_attn = getattr(self.c_attn, attr)
+        
+            self.kv_hook = KVCacheHook(d_model)
+            self.c_attn.register_forward_hook(self.kv_hook.hook_fn)
+
+    def forward(self, current_memory, prev_memories):
+        out = self.layer(current_memory)
+        return out[0]
+
+    def clear_cache(self):
+        self.kv_hook.clear_cache()
+
+class GPTMemoryFullAttention(torch.nn.Module):
+    def __init__(self, layer, num_mem_tokens, res_mem_count=-1):
+        super().__init__()
+        self.layer = copy.deepcopy(layer)
+        self.num_mem_tokens = num_mem_tokens
+        self.res_mem_count = res_mem_count
+
+    def forward(self, current_memory, prev_memories):
+        current_memory = torch.cat(prev_memories, dim=1)
+        out = self.layer(current_memory)[0]
+        out = out[:, -self.num_mem_tokens:, :]
+        return out
 
 
 def apply_rope_with_segments(memory_state, segment_num):
@@ -54,7 +124,7 @@ def apply_rope_with_segments(memory_state, segment_num):
 
     theta = torch.exp(-1j * (torch.arange(0, d_model, 2, device=memory_state.device) / d_model))
     theta = theta.unsqueeze(0)  #  (1, d_model // 2)
-    positions = torch.ones(seq_length, device=memory_state.device, dtype=torch.float) * segment_num
+    positions = torch.ones(seq_length, device=memory_state.device, dtype=memory_state.dtype) * segment_num
     positions = positions.unsqueeze(-1) # (seq_length, 1)
     complex_pos = torch.exp(1j * positions * theta) # (seq_length, d_model // 2)
 
@@ -68,7 +138,7 @@ def apply_rope_with_segments(memory_state, segment_num):
 
 
 class MemoryLayerWrapper(nn.Module):
-    def __init__(self, layer, num_mem_tokens, memory_dim, res_mem_count=-1, embd_std=0.02):
+    def __init__(self, layer, num_mem_tokens, memory_dim, res_mem_count=-1, embd_std=0.02, aggr_type='mem_attn'):
         super().__init__()
         self.layer = layer
 
@@ -77,7 +147,15 @@ class MemoryLayerWrapper(nn.Module):
         self.create_memory(memory_dim, num_mem_tokens, embd_std)
 
         self.memory_state = None
-        self.aggregator = MemoryAttention(memory_dim=memory_dim, res_mem_count=res_mem_count)
+        if self.res_mem_count not in {0, None}:
+            if aggr_type in ('mem_attn', None):
+                self.aggregator = MemoryAttention(memory_dim=memory_dim, res_mem_count=res_mem_count)
+            elif aggr_type == 'layer':
+                self.aggregator = GPTMemoryAttention(layer, d_model=memory_dim, res_mem_count=res_mem_count)
+            elif aggr_type == 'full':
+                self.aggregator = GPTMemoryFullAttention(layer, num_mem_tokens=num_mem_tokens, res_mem_count=res_mem_count)
+        else:
+            self.aggregator = None
         self.past_memory_states = []
 
         self.generate_mode = False
@@ -85,7 +163,8 @@ class MemoryLayerWrapper(nn.Module):
         self.seg_num = 0
 
     def create_memory(self, memory_dim, num_mem_tokens, embd_std):
-        memory_weights = torch.randn((num_mem_tokens, memory_dim)) * embd_std
+        # memory_weights = torch.randn((num_mem_tokens, memory_dim)) * embd_std
+        memory_weights = torch.zeros((num_mem_tokens, memory_dim))
         self.register_parameter('memory', torch.nn.Parameter(memory_weights, requires_grad=True))
 
         self.read_memory_position = range(num_mem_tokens)
@@ -95,56 +174,39 @@ class MemoryLayerWrapper(nn.Module):
         memory = self.memory.repeat(input_shape[0], 1, 1)
         return memory
     
-    def pad_attention_mask(self, attention_mask, shape):
-        if self.num_mem_tokens in {0, None}:
-            return attention_mask
-        else:
-            mask = torch.ones([shape[0], 1, shape[1], shape[1]], dtype=torch.bool).to(attention_mask.device)
-            mask[:, :, self.num_mem_tokens: self.num_mem_tokens + attention_mask.shape[-1], self.num_mem_tokens: self.num_mem_tokens + attention_mask.shape[-1]] = attention_mask
-            return mask
-
     def forward(self, hidden_states, attention_mask=None, **kwargs):
+        if self.num_mem_tokens > 0 and not self.generate_mode and self.memory_state is not None and self.aggregator is not None:
+            memory_pos_embeds = apply_rope_with_segments(self.memory_state, self.seg_num).type_as(self.memory_state)
+            self.past_memory_states.append(memory_pos_embeds)
+            self.memory_state = self.aggregator(memory_pos_embeds, self.past_memory_states)
+
         self.seg_num += 1
         if self.memory_state is None:
             self.memory_state = self.set_memory(hidden_states.shape)
-
+        
         if self.num_mem_tokens > 0:
             if not self.generate_mode:
-                # hidden_states = torch.cat([self.memory_state, hidden_states, self.memory_state], dim=1)
-                hidden_states[:, :self.num_mem_tokens, :] = self.memory_state
-                hidden_states[:, -self.num_mem_tokens:, :] = self.memory_state
-            elif self.first_segment:
-                # hidden_states = torch.cat([self.memory_state, hidden_states], dim=1)
-                hidden_states[:, :self.num_mem_tokens, :] = self.memory_state
-        
-        # if self.first_segment and attention_mask is not None:
-        #     attention_mask = self.pad_attention_mask(attention_mask, hidden_states.shape)
-        
-        out = self.layer(hidden_states=hidden_states, attention_mask=attention_mask, **kwargs)
-
-        if self.num_mem_tokens > 0:
-            if not self.generate_mode:
-                self.memory_state = apply_rope_with_segments(out[0][:, -self.num_mem_tokens:], self.seg_num)
-
-                if self.aggregator is not None:
-                    self.past_memory_states.append(self.memory_state)
-                    self.memory_state = self.aggregator(self.memory_state, self.past_memory_states)
-
-                # out = (out[0][:, self.num_mem_tokens:-self.num_mem_tokens, :],) + (out[1:])
+                hidden_states = hidden_states[:, self.num_mem_tokens:-self.num_mem_tokens, :]
+                hidden_states = torch.cat([self.memory_state, hidden_states, self.memory_state], dim=1)
             elif self.first_segment:
                 self.first_segment = False
-                # out = (out[0][:, self.num_mem_tokens:, :],) + (out[1:])
-
+                hidden_states = hidden_states[:, self.num_mem_tokens:]
+                hidden_states = torch.cat([self.memory_state, hidden_states], dim=1)
+        
+        out = self.layer(hidden_states=hidden_states, attention_mask=attention_mask, **kwargs)
+        self.memory_state = out[0][:, -self.num_mem_tokens:]
         return out
 
     def reset_memory(self):
         self.memory_state = None
         self.past_memory_states.clear()
         self.seg_num = 0
+        if hasattr(self.aggregator, 'clear_cache'):
+            self.aggregator.clear_cache()
 
 
 class MemoryCell(nn.Module):
-    def __init__(self, base_model, num_mem_tokens, res_mem_count=-1, layers_attr: str = 'transformer.h'):
+    def __init__(self, base_model, num_mem_tokens, res_mem_count=-1, layers_attr: str = 'transformer.h', aggr_type='mem_attn'):
         super().__init__()
         self.model = base_model
         self.num_mem_tokens = num_mem_tokens
@@ -160,7 +222,8 @@ class MemoryCell(nn.Module):
                 num_mem_tokens=num_mem_tokens,
                 memory_dim=self.model.config.hidden_size,
                 res_mem_count=res_mem_count,
-                embd_std=self.model.get_input_embeddings().weight.data.std()
+                embd_std=self.model.get_input_embeddings().weight.data.std(),
+                aggr_type=aggr_type
             )
 
     def forward(self, input_ids, **kwargs):
@@ -193,7 +256,7 @@ class MemoryCell(nn.Module):
             inputs_embeds = self.model.get_input_embeddings()(input_ids)
         
         if self.num_mem_tokens > 0:
-            blank_tokens = torch.zeros((inputs_embeds.shape[0], self.num_mem_tokens, inputs_embeds.shape[2]), dtype=torch.float, device=inputs_embeds.device)
+            blank_tokens = torch.zeros((inputs_embeds.shape[0], self.num_mem_tokens, inputs_embeds.shape[2]), dtype=inputs_embeds.dtype, device=inputs_embeds.device)
             if write_mem:
                 inputs_embeds = torch.cat([blank_tokens, inputs_embeds, blank_tokens], dim=1)
             else:
@@ -202,8 +265,7 @@ class MemoryCell(nn.Module):
         seg_kwargs['input_ids'] = None
         seg_kwargs['inputs_embeds'] = inputs_embeds
         if kwargs.get('attention_mask') is not None:
-            seg_kwargs['attention_mask'] = self.pad_attention_mask(kwargs['attention_mask'], inputs_embeds.shape,
-                                                                   kwargs.get('write_mem', True))
+            seg_kwargs['attention_mask'] = self.pad_attention_mask(kwargs['attention_mask'], inputs_embeds.shape)
             # seg_kwargs['attention_mask'] = kwargs.get('attention_mask')
         seg_kwargs['output_hidden_states'] = True
         return seg_kwargs
@@ -222,12 +284,11 @@ class MemoryCell(nn.Module):
         
         return out 
     
-    def pad_attention_mask(self, attention_mask, shape, write_mem):
+    def pad_attention_mask(self, attention_mask, shape):
         if self.num_mem_tokens in {0, None}:
             return attention_mask
         else:
             shape = list(shape)[:2]
-            # shape[1] += self.num_mem_tokens * (1 + write_mem)
             mask = torch.ones(*shape, dtype=torch.int64).to(attention_mask.device)
             mask[:, self.num_mem_tokens: self.num_mem_tokens + attention_mask.shape[1]] = attention_mask
             return mask
@@ -258,8 +319,7 @@ class RecurrentWrapper(nn.Module):
         cell_outputs = []
         self.memory_cell.reset_memory()
         for seg_num, segment in enumerate(segmented):
-            print(seg_num, segment['input_ids'].shape)
-            cell_out = self.memory_cell(**segment, output_hidden_states=True)
+            cell_out = self.memory_cell(**segment, output_attentions=output_attentions, output_hidden_states=True)
             cell_outputs.append(cell_out)
             self.memory_cell.manage_gradients(seg_num, self.rmt_config.get('k2'), self.rmt_config.get('max_n_segments'))
 

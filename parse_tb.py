@@ -74,7 +74,7 @@ def parse_to_df(path, target_cols, metric_names, silent=SILENT):
         experiments += [expr]
 
     experiments = pd.DataFrame(experiments)
-    # print('\n\ncolumns: ', experiments.columns)
+    print('\n\ncolumns: ', experiments.columns)
     
     not_found_cols = [col for col in target_cols if col not in experiments.columns]
     if not_found_cols:
@@ -83,7 +83,7 @@ def parse_to_df(path, target_cols, metric_names, silent=SILENT):
     
     found_cols = [col for col in target_cols if col in experiments.columns]
     experiments = experiments[found_cols]
-    # print(experiments)
+    print(experiments)
     return experiments
     # print('\n\ncolumns: ', experiments.columns)
 
@@ -92,14 +92,14 @@ def parse_to_df(path, target_cols, metric_names, silent=SILENT):
 
 # babilong new 
 paths = [
-        '/home/bulatov/runs/babilong/',
+        '/data/home/admin/rmt/runs/',
         ]
 
 paths = [Path(p) for p in paths]
 metric_names = ['exact_match']
 new_cols = ['input_size', 'k1', 'k2', 'freeze_model_weights', 'use_truncated_backward', 'retain_grad']#, 'noise_n_segments']
 target_cols = TGT_COLS + ['best_valid_exact_match', 'exact_match'] + new_cols
-out_path = 'results/babilong_new.csv'
+out_path = '/data/home/admin/rmt/results/babilong_new.csv'
 
 dfs = [parse_to_df(p, target_cols, metric_names) for p in paths]
 df = pd.concat(dfs)
