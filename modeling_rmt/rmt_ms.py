@@ -1,141 +1,9 @@
-import copy
 import math
-import random
-
 import torch
 from torch import nn
 
-from lm_experiments_tools.utils import RMTOutput, DummyAttentionOutput
-
-
-class MemoryAttention(torch.nn.Module):
-    def __init__(self, memory_dim, res_mem_count, hidden_dim=None, num_heads=1, embd_std=0.02):
-        super().__init__()
-        if hidden_dim is None:
-            hidden_dim = memory_dim * 4
-
-        self.memory_dim = memory_dim
-        self.res_mem_count = res_mem_count
-        self.attention = torch.nn.MultiheadAttention(embed_dim=memory_dim, num_heads=num_heads, batch_first=True)
-        self.feedforward = torch.nn.Sequential(
-            torch.nn.Linear(memory_dim, hidden_dim),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden_dim, memory_dim)
-        )
-        self.norm1 = torch.nn.LayerNorm(memory_dim)
-        self.norm2 = torch.nn.LayerNorm(memory_dim)
-
-        self._init_weights(embd_std)
-
-    def _init_weights(self, embd_std):
-        for n, p in self.named_parameters():
-            if "weight" in n:
-                if "attention" in n:
-                    nn.init.normal_(p, mean=0.0, std=embd_std)
-                elif "norm" in n:
-                    nn.init.ones_(p)
-                else:
-                    nn.init.xavier_uniform_(p)
-            elif "bias" in n:
-                nn.init.zeros_(p)
-
-    def forward(self, current_memory, prev_memories):
-        if len(prev_memories) == 0 or self.res_mem_count == 0:
-            return current_memory
-        
-        elif self.res_mem_count > 0:
-            memory_dropout = random.sample(prev_memories, min(len(prev_memories), self.res_mem_count))
-            memory_cat = torch.cat(memory_dropout, dim=1)
-            attn_output, attn_map = self.attention(query=current_memory, key=memory_cat, value=memory_cat) # K [memory_dim, n_tokens * n_memory] @ V^T
-
-        else:
-            memory_cat = torch.cat(prev_memories, dim=1)
-            attn_output, attn_map = self.attention(query=current_memory, key=memory_cat, value=memory_cat)
-
-        updated_memory = current_memory + attn_output 
-        updated_memory = self.norm1(updated_memory)
-        updated_memory = updated_memory + self.feedforward(updated_memory)
-        updated_memory = self.norm2(updated_memory)
-
-        return updated_memory
-
-
-class KVCacheHook:
-    def __init__(self, d_model):
-        self.d_model = d_model
-        self.cached_k = None
-        self.cached_v = None
-
-    def hook_fn(self, module, inputs, output):
-        d_model = self.d_model
-        q, k, v = output.split(d_model, dim=-1)
-        if self.cached_k is None or self.cached_v is None:
-            self.cached_k = k
-            self.cached_v = v
-        else:
-            self.cached_k = torch.cat([self.cached_k, k], dim=1)
-            self.cached_v = torch.cat([self.cached_v, v], dim=1)
-        
-        return DummyAttentionOutput(data=(q, self.cached_k, self.cached_v))
-    
-    def clear_cache(self):
-        self.cached_k = None
-        self.cached_v = None
-
-
-class GPTMemoryAttention(torch.nn.Module):
-    def __init__(self, layer, d_model, res_mem_count=-1, c_attn_attr: str = 'attn.c_attn'):
-        super().__init__()
-        self.layer = copy.deepcopy(layer)
-        self.res_mem_count = res_mem_count
-
-        if c_attn_attr is not None:
-            self.c_attn_attrs = c_attn_attr.split('.')
-            self.c_attn = self.layer
-            for i, attr in enumerate(self.c_attn_attrs):
-                self.c_attn = getattr(self.c_attn, attr)
-        
-            self.kv_hook = KVCacheHook(d_model)
-            self.c_attn.register_forward_hook(self.kv_hook.hook_fn)
-
-    def forward(self, current_memory, prev_memories):
-        out = self.layer(current_memory)
-        return out[0]
-
-    def clear_cache(self):
-        self.kv_hook.clear_cache()
-
-class GPTMemoryFullAttention(torch.nn.Module):
-    def __init__(self, layer, num_mem_tokens, res_mem_count=-1):
-        super().__init__()
-        self.layer = copy.deepcopy(layer)
-        self.num_mem_tokens = num_mem_tokens
-        self.res_mem_count = res_mem_count
-
-    def forward(self, current_memory, prev_memories):
-        current_memory = torch.cat(prev_memories, dim=1)
-        out = self.layer(current_memory)[0]
-        out = out[:, -self.num_mem_tokens:, :]
-        return out
-
-
-def apply_rope_with_segments(memory_state, segment_num):
-    batch_size, seq_length, d_model = memory_state.shape
-
-    theta = torch.exp(-1j * (torch.arange(0, d_model, 2, device=memory_state.device) / d_model))
-    theta = theta.unsqueeze(0)  #  (1, d_model // 2)
-    positions = torch.ones(seq_length, device=memory_state.device, dtype=memory_state.dtype) * segment_num
-    positions = positions.unsqueeze(-1) # (seq_length, 1)
-    complex_pos = torch.exp(1j * positions * theta) # (seq_length, d_model // 2)
-
-    memory_state = memory_state.view(batch_size, seq_length, d_model // 2, 2)
-    embeddings_complex = memory_state[..., 0] + 1j * memory_state[..., 1]  # (batch_size, seq_length, d_model // 2)
-
-    embeddings_rotated = embeddings_complex * complex_pos  # (batch_size, seq_length, d_model // 2)
-
-    embeddings_rotated = torch.stack([embeddings_rotated.real, embeddings_rotated.imag], dim=-1)
-    return embeddings_rotated.view(batch_size, seq_length, d_model)
-
+from lm_experiments_tools.utils import RMTOutput
+from modeling_rmt.rmt_br import MemoryAttention, GPTMemoryAttention, GPTMemoryFullAttention, apply_rope_with_segments
 
 class MemoryLayerWrapper(nn.Module):
     def __init__(self, layer, num_mem_tokens, memory_dim, res_mem_count=-1, embd_std=0.02, aggr_type='mem_attn', aggr_pos_embed='rope', **kwargs):
@@ -144,10 +12,11 @@ class MemoryLayerWrapper(nn.Module):
 
         self.num_mem_tokens = num_mem_tokens
         self.res_mem_count = res_mem_count
-        self.create_memory(memory_dim, num_mem_tokens, embd_std)
+        if self.num_mem_tokens > 0:
+            self.create_memory(memory_dim, num_mem_tokens, embd_std)
 
         self.memory_state = None
-        if self.res_mem_count not in {0, None}:
+        if self.res_mem_count not in {0, None} and num_mem_tokens > 0:
             if aggr_type in ('mem_attn', None):
                 self.aggregator = MemoryAttention(memory_dim=memory_dim, res_mem_count=res_mem_count)
             elif aggr_type == 'layer':
@@ -162,8 +31,8 @@ class MemoryLayerWrapper(nn.Module):
 
         if aggr_pos_embed == 'rope':
             self.pos_embed_func = apply_rope_with_segments
-        elif aggr_pos_embed == 'sin':
-            self.pos_embed_func = lambda x, y: x
+        # elif aggr_pos_embed == 'sin':
+        #     self.pos_embed_func = lambda x, y: x
         elif aggr_pos_embed == 'none':
             self.pos_embed_func = lambda x, y: x
 
@@ -171,9 +40,11 @@ class MemoryLayerWrapper(nn.Module):
         self.first_segment = True
         self.seg_num = 0
 
+        self.prev_layer = None
+
     def create_memory(self, memory_dim, num_mem_tokens, embd_std):
-        # memory_weights = torch.randn((num_mem_tokens, memory_dim)) * embd_std
-        memory_weights = torch.zeros((num_mem_tokens, memory_dim))
+        memory_weights = torch.randn((num_mem_tokens, memory_dim)) * embd_std
+        # memory_weights = torch.zeros((num_mem_tokens, memory_dim))
         self.register_parameter('memory', torch.nn.Parameter(memory_weights, requires_grad=True))
 
         self.read_memory_position = range(num_mem_tokens)
@@ -190,20 +61,27 @@ class MemoryLayerWrapper(nn.Module):
             self.memory_state = self.aggregator(memory_pos_embeds, self.past_memory_states)
 
         self.seg_num += 1
-        if self.memory_state is None:
-            self.memory_state = self.set_memory(hidden_states.shape)
-        
+
         if self.num_mem_tokens > 0:
+            if self.memory_state is None:
+                self.memory_state = self.set_memory(hidden_states.shape)
+            if self.prev_layer is None:
+                prev_layer_memory = self.set_memory(hidden_states.shape)
+            else:
+                prev_layer_memory = self.prev_layer.memory_state
+
             if not self.generate_mode:
-                hidden_states = hidden_states[:, self.num_mem_tokens:-self.num_mem_tokens, :]
-                hidden_states = torch.cat([self.memory_state, hidden_states, self.memory_state], dim=1)
+                hidden_states = hidden_states[:, self.num_mem_tokens * 2:-self.num_mem_tokens, :]
+                hidden_states = torch.cat([self.memory_state, prev_layer_memory, hidden_states, self.memory_state], dim=1)
             elif self.first_segment:
-                self.first_segment = False
-                hidden_states = hidden_states[:, self.num_mem_tokens:]
-                hidden_states = torch.cat([self.memory_state, hidden_states], dim=1)
+                # self.first_segment = False
+                hidden_states = hidden_states[:, self.num_mem_tokens * 2:]
+                hidden_states = torch.cat([self.memory_state, prev_layer_memory, hidden_states], dim=1)
         
+        print(self.seg_num, 'after', hidden_states.shape)
         out = self.layer(hidden_states=hidden_states, attention_mask=attention_mask, **kwargs)
-        self.memory_state = out[0][:, -self.num_mem_tokens:]
+        if self.num_mem_tokens > 0:
+            self.memory_state = out[0][:, -self.num_mem_tokens:]
         return out
 
     def reset_memory(self):
@@ -241,6 +119,9 @@ class MemoryCell(nn.Module):
                 aggr_pos_embed=aggr_pos_embed,
                 **kwargs
             )
+        
+        for i in range(1, len(self.layers)):
+            self.layers[i].prev_layer = self.layers[i - 1]
 
     def forward(self, input_ids, **kwargs):
         seg_kwargs = self.process_input(input_ids, write_mem=True, **kwargs)

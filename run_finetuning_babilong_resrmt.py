@@ -105,6 +105,7 @@ parser.add_argument('--k2', type=int, default=-1, help='number of last segments 
 parser.add_argument('--skip_connection_length', type=int, default=-1, help='how many segments back are connected')
 parser.add_argument('--res_mem_count', type=int, default=-1, help='max number of memory segments to keep after dropout')
 parser.add_argument('--aggr_type', type=str, default='mem_attn', help='aggregation type for memory retrieval')
+parser.add_argument('--aggr_pos_embed', type=str, default='rope', help='positional embeddings for memory tokens')
 parser.add_argument('--freeze_model_weights', action='store_true', default=False,
                     help='Stop training all model weights except memory layers')
 parser.add_argument('--backbone_cpt', type=str, default=None, help='backbone model checkpoint path')
@@ -368,9 +369,11 @@ if __name__ == '__main__':
                 mem_cell_args["num_mem_tokens"] = args.num_mem_tokens
             if args.memory_cell_cls == 'modeling_rmt.rmt_br:MemoryCell':
                 if args.layers_attr is not None:
-                    mem_cell_args["layers_attr"] = args.layer_attr
+                    mem_cell_args["layers_attr"] = args.layers_attr
                 if args.aggr_type is not None:
                     mem_cell_args["aggr_type"] = args.aggr_type
+                if args.aggr_pos_embed is not None:
+                    mem_cell_args["aggr_pos_embed"] = args.aggr_pos_embed
                 mem_cell_args["res_mem_count"] = args.res_mem_count
 
             memory_cell_cls = get_cls_by_name(args.memory_cell_cls)
