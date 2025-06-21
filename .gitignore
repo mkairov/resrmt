@@ -140,7 +140,8 @@ dmypy.json
 runs/
 data/*.tsv
 
-accel_configs
+accel_configs/exp
+base_models/*/*.json
 *.err
 data
-
+datasets
