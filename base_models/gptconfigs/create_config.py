@@ -2,12 +2,14 @@ import os
 import json
 import argparse
 
-save_folder = "/home/jovyan/rmt/wip/base_models/gptconfigs/"
+save_folder = "/home/admin/rmt/base_models/gptconfigs/"
 default_config = {
   "architectures": [
     "GPTNeoXForCausalLM"
+    # "GPT2LMHeadModel"
   ],
   "model_type": "gpt_neox",
+  # "model_type": "gpt2",
   "vocab_size": 128,
   "hidden_size": 128, 
   "num_hidden_layers": 1, 
@@ -41,6 +43,7 @@ config['num_hidden_layers'] = int(args.num_hidden_layers)
 config['num_attention_heads'] = int(args.num_attention_heads)
 
 config_name = f"neox_tiny_{args.num_hidden_layers}l{args.num_attention_heads}hd{args.hidden_size}"
+# config_name = f"gpt2_tiny_{args.num_hidden_layers}l{args.num_attention_heads}hd{args.hidden_size}"
 print(f'Saving config {config_name}')
 save_path = os.path.join(save_folder, f'{config_name}.json')
 with open(save_path, 'w') as f:
