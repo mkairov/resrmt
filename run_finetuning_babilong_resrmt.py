@@ -78,7 +78,7 @@ parser.add_argument('--model_cls', type=str, default='transformers:BertForPreTra
                     help='model class name to use (default: transformers:BertForPreTraining)')
 parser.add_argument('--memory_cell_cls', type=str, default=None, help='cell class for RMT')
 parser.add_argument('--recurrent_wrapper_cls', type=str, default=None, help='recurrent wrapper class for RMT')
-# parser.add_argument('--model_cpt', type=str, default=None, help='pretrained model checkpoint path')
+parser.add_argument('--model_cpt', type=str, default=None, help='pretrained model checkpoint path')
 parser.add_argument('--model_type', type=str, default='encoder-decoder',
                     help='model type, encoder, encoder-decoder, decoder, affects preprocessing '
                          '(default: encoder-decoder)')
@@ -111,6 +111,9 @@ parser.add_argument('--freeze_model_weights', action='store_true', default=False
 parser.add_argument('--backbone_cpt', type=str, default=None, help='backbone model checkpoint path')
 parser.add_argument('--no_memory_cell', action='store_true', default=False,
                     help='In case the model class implements memory cell functions')
+parser.add_argument('--d_mem', type=int, default=None, help='number of rows in associative matrix')
+parser.add_argument('--no_correction', action='store_true', default=False,
+                    help='ARMT shmidhuber correction for rewriting')
 
 # tokenizer
 # todo: add wordpiece tokenizers support?
@@ -336,7 +339,7 @@ if __name__ == '__main__':
 
     ## load cpt of backbone model
     if args.backbone_cpt:
-        backbone_cpt = os.path.join(args.backbone_cpt, "pytorch_model.bin")
+        backbone_cpt = os.path.join(args.backbone_cpt, "model.pth")
         model = torch.load(backbone_cpt, map_location='cpu')
         logger.info(f'Loaded baseline state dict from: {args.backbone_cpt}')
 
@@ -354,6 +357,10 @@ if __name__ == '__main__':
             mem_cell_args["aggr_pos_embed"] = args.aggr_pos_embed
         if args.res_mem_count is not None:
             mem_cell_args["res_mem_count"] = args.res_mem_count
+        if args.d_mem is not None:
+            mem_cell_args["d_mem"] = args.d_mem
+        if args.no_correction:
+            mem_cell_args["correction"] = False
 
         memory_cell_cls = get_cls_by_name(args.memory_cell_cls)
         recurrent_wrapper_cls = get_cls_by_name(args.recurrent_wrapper_cls)
@@ -376,12 +383,12 @@ if __name__ == '__main__':
                                     
 
         ## load cpt of rmt
-        # logger.info(f'MODEL CHECKPOINT IS: {args.model_cpt}')
-        # if args.model_cpt:
-        #     model_cpt = os.path.join(args.model_cpt, "pytorch_model.bin")
-        #     cpt = torch.load(model_cpt, map_location='cpu')
-        #     model.load_state_dict(cpt, strict=False)
-        #     logger.info(f'Loaded RMT state dict from: {args.model_cpt}')
+        logger.info(f'MODEL CHECKPOINT IS: {args.model_cpt}')
+        if args.model_cpt:
+            model_cpt = os.path.join(args.model_cpt, "model.pth")
+            cpt = torch.load(model_cpt, map_location='cpu')
+            model.load_state_dict(cpt, strict=False)
+            logger.info(f'Loaded RMT state dict from: {args.model_cpt}')
 
     if args.freeze_model_weights:
         for n, p in model.named_parameters():
