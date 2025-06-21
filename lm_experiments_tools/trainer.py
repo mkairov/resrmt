@@ -2,6 +2,7 @@ import contextlib
 import itertools
 import json
 import time
+import os
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -21,8 +22,6 @@ from lm_experiments_tools.utils import rank_0, get_fn_param_names
 import accelerate
 from accelerate.logging import get_logger
 logger = get_logger('')
-
-import schedulefree
 
 
 @dataclass
@@ -46,29 +45,22 @@ class TrainerArgs:
         default=False,
         metadata={'help': 'Use model.generate method when running validation step (default: False)'})
     # load model args
-    model_cpt: Optional[str] = field(
+    init_checkpoint: Optional[str] = field(
         default=None,
         metadata={'help': 'path to init checkpoint to load a model from (default: None).'})
     skip_used_data: bool = field(
         default=False,
-        metadata={'help': 'skip batches that were already seen by model_cpt (default: False)'})
-    
-    best_metric_value: Optional[float] = field(
-        default=None,
-        metadata={'help': 'metric value at which training is stopped'}
-    )
-    
-    reset_lr: Optional[bool] = field(
+        metadata={'help': 'skip batches that were already seen by init_checkpoint (default: False)'})
+    reset_lr: bool = field(
         default=False,
         metadata={'help': 'Do not load lr_scheduler from checkpoint and setup new lr (default: False)'})
-    reset_iteration: Optional[bool] = field(
+    reset_iteration: bool = field(
         default=False,
         metadata={'help': 'Do not load iteration number from checkpoint and set it to 0 (default: False)'})
-    reset_optimizer: Optional[bool] = field(
+    reset_optimizer: bool = field(
         default=False,
         metadata={'help': 'Do not load optimizer from checkpoint and setup a new one. It might help for continuing '
                           'training from ckpt saved from fp16 O2. Otherwise loss spikes might happen (default: False)'})
-
     # training args
     lr: Optional[float] = field(
         default=None,
@@ -92,15 +84,15 @@ class TrainerArgs:
         default=None,
         metadata={'help': 'stop training if `early_stopping_patience` subsequent evalutations did not improve value of '
                           '`optimize_metric` on validation set (default: None)'})
+    best_metric_value: Optional[float] = field(
+        default=None,
+        metadata={'help': 'trigger early stopping if metric value is achieved'}
+    )
     # scheduler args
     lr_scheduler: Optional[str] = field(
         default=None,
         metadata={'help': 'scheduler name from transformers.optimization: linear, cosine, cosine_with_restarts, '
                           'polynomial, constant, constant_with_warmup (default: None)'})
-    lr_schedule_free: bool = field(
-        default=False,
-        metadata={'help': 'using a Meta Research ScheduleFree optimizer'}
-    )
     num_warmup_steps: Optional[int] = field(
         default=None,
         metadata={'help': 'number of warming steps to get to lr (default: None)'})
@@ -132,11 +124,6 @@ class TrainerArgs:
     lr_drop_eps: float = field(
         default=1e-08,
         metadata={'help': 'torch.optim.lr_scheduler.ReduceLROnPlateau threshold_mode parameter. (default: 1e-08)'})
-    # for lr with restarts
-    lr_num_cycles: int = field(
-        default=1,
-        metadata={'help': 'number of cycles for cosine lr with restarts. (default: 1)'}
-    )
     # metrics args
     optimize_metric: str = field(
         default='loss',
@@ -245,13 +232,8 @@ class Trainer:
                 raise RuntimeError('Set learning_rate to use learning rate schedulers.')
             if args.num_training_steps is None:
                 args.num_training_steps = args.iters
-            if args.lr_scheduler == 'cosine_with_restarts':
-                logger.info(f'number of restarts for cosine schedule = {args.lr_num_cycles}')
-                self.lr_scheduler = get_scheduler(args.lr_scheduler, self.optimizer, args.num_warmup_steps,
-                                                  args.num_training_steps, {'num_cycles': args.lr_num_cycles})
-            else:
-                self.lr_scheduler = get_scheduler(args.lr_scheduler, self.optimizer,
-                                                args.num_warmup_steps, args.num_training_steps)
+            self.lr_scheduler = get_scheduler(args.lr_scheduler, self.optimizer,
+                                              args.num_warmup_steps, args.num_training_steps)
             # todo: do we need to prepare scheduler with accelerate?
             self.accelerator.register_for_checkpointing(self.lr_scheduler)
         else:
@@ -283,9 +265,8 @@ class Trainer:
         self._reset_metrics_data()
         # self.metrics keeps the last logged metrics
         self._reset_metrics()
-
-        if self.args.model_cpt:
-            self.load(args.model_cpt, args.reset_optimizer, args.reset_lr, args.reset_iteration)
+        if self.args.init_checkpoint:
+            self.load(args.init_checkpoint, self.args.reset_optimizer, self.args.reset_lr, self.args.reset_iteration)
 
     def step(self, batch, is_train_mode=True) -> Tuple[Dict[str, float], Dict[str, list]]:
         """Performs one step (forward and optionally backward and optimizer.step()) over data in a batch.
@@ -300,15 +281,12 @@ class Trainer:
         Returns:
             float: loss on batch
         """
+        self.model.to(self.device)
         if is_train_mode:
             self.model.train()
-            if self.args.lr_schedule_free:
-                self.optimizer.train()
             self.optimizer.zero_grad()
         else:
             self.model.eval()
-            if self.args.lr_schedule_free:
-                self.optimizer.eval()
 
         if self.batch_transform_fn:
             batch = self.batch_transform_fn(batch)
@@ -341,20 +319,15 @@ class Trainer:
 
                     if not is_train_mode and self.args.use_generate_on_valid:
                         generate_kwargs = deepcopy(self.generate_kwargs)
-                        if 'max_length' not in generate_kwargs and 'labels' in subbatch and 'max_new_tokens' not in generate_kwargs:
+                        if 'max_length' not in generate_kwargs and 'labels' in subbatch:
                             # if max_length is not set and labels are in subbatch, generate to the length of labels+1
                             # +1 as special tokens could be generated by the model
                             generate_kwargs['max_length'] = subbatch['labels'].shape[-1] + 1
-                        if 'attention_mask_generate' in subbatch:
-                            generate_kwargs['attention_mask'] = subbatch['attention_mask_generate'].to(self.device)
-                        elif 'attention_mask' in subbatch:
+                        if 'attention_mask' in subbatch:
                             generate_kwargs['attention_mask'] = subbatch['attention_mask']
                         if 'global_attention_mask' in subbatch:
                             generate_kwargs['global_attention_mask'] = subbatch['global_attention_mask']
-                        if 'input_ids_generate' in subbatch:
-                            generation_outputs = self.accelerator.unwrap_model(self.model).generate(subbatch['input_ids_generate'].to(self.device), **generate_kwargs)
-                        else:
-                            generation_outputs = self.accelerator.unwrap_model(self.model).generate(subbatch['input_ids'], **generate_kwargs)
+                        generation_outputs = self.accelerator.unwrap_model(self.model).generate(subbatch['input_ids'], **generate_kwargs)
                         outputs['generation_outputs'] = generation_outputs
 
                     metrics = self.batch_metrics_fn(subbatch, outputs)
@@ -401,9 +374,8 @@ class Trainer:
             self.accelerator.clip_grad_value_(params, self.args.clip_grad_value)
             grad_norm = self._get_gradients_global_norm()
         elif self.args.clip_grad_norm:
-            grad_norm = self.model._global_grad_norm
+            grad_norm = self.accelerator.clip_grad_norm_(params, self.args.clip_grad_norm)
             grad_norm = grad_norm.item() if grad_norm is not None else 0.0
-            self.accelerator.clip_grad_norm_(params, self.args.clip_grad_norm)
         return grad_norm
 
     def _get_gradients_global_norm(self):
@@ -562,6 +534,7 @@ class Trainer:
         valid_loss = np.inf
         train_loss = np.inf
         self.early_stopping_counter = 0
+        self.best_metric_trigger = False
         for batch in train_batches:
             iteration_start = time.time()
             batch_metrics, batch_metrics_data = self.step(batch, is_train_mode=True)
@@ -617,27 +590,22 @@ class Trainer:
                     logger.info(f'The best {self.args.optimize_metric} metric was improved to: {best_valid_metric}')
                     if self.args.save_best:
                         self.save(self.args.model_path, suffix='best')
-                
                 else:
                     self.early_stopping_counter += 1
                     logger.info(f'Metric was not improved for the last #{self.early_stopping_counter} evaluations')
+                if best_valid_metric == self.args.best_metric_value:
+                    self.best_metric_trigger = True
                 if self.accelerator.is_main_process and self.tb:
                     self.tb.add_scalar('patience/iterations', self.early_stopping_counter, self.n_iter)
                     self.tb.add_scalar('patience/samples', self.early_stopping_counter,
                                        self.n_iter * self.global_batch_size)
-                    
-                # добавил остановку обучения если достигли наилучшего значения метрики
-                if valid_metric == self.args.best_metric_value:
-                    logger.info('Early stopping triggered: stopping training')
-                    break
-
                 if self.lr_drop_scheduler:
                     self.lr_drop_scheduler.step(valid_metric)
 
             # saving model
             if self.args.save_interval and self.n_iter % self.args.save_interval == 0:
                 self.save(self.args.model_path)
-
+            
             pbar.update(1)
             pbar.set_postfix({'train_loss': f'{train_loss:.3f}',
                               'valid_loss': f'{valid_loss:.3f}',
@@ -645,7 +613,7 @@ class Trainer:
                               })
 
             if self.args.early_stopping_patience is not None and \
-                    self.early_stopping_counter > self.args.early_stopping_patience:
+                    self.early_stopping_counter > self.args.early_stopping_patience or self.best_metric_trigger:
                 logger.info('Early stopping triggered: stopping training...')
                 break
 
@@ -711,12 +679,10 @@ class Trainer:
         elif load_path.is_file() and (load_path.parent / 'trainer.pckl').exists():
             trainer_state_path = load_path.parent / 'trainer.pckl'
         if trainer_state_path:
-            trainer_state = torch.load(trainer_state_path, map_location='cpu')
+            trainer_state = torch.load(trainer_state_path, map_location='cpu', weights_only=False)
         if not reset_iteration:
             self.n_iter = trainer_state.get('iteration', 0) + 1  # as saved iteration is already performed
             self.n_epoch = trainer_state.get('epoch', 0)
-        else:
-            logger.info(f'Resetting iteration from {trainer_state.get("iteration", 0)}, epoch from {trainer_state.get("epoch", 0)}')
 
         if not load_only_model_ckpt:
             logger.info('Loading model, trainer, and accelerate state')
@@ -730,7 +696,6 @@ class Trainer:
         else:
             logger.info(f'Loading model from {load_path}')
             checkpoint = torch.load(load_path / 'model.pth', map_location='cpu', weights_only=False)
-            # checkpoint = safetensors.torch.load_file(load_path / 'model.safetensors', device='cpu')
             missing_k, unexpected_k = self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint, strict=False)
             if len(missing_k) != 0:
                 logger.info(f'{missing_k} were not loaded from checkpoint! These parameters were randomly initialized.')
@@ -739,13 +704,6 @@ class Trainer:
             del checkpoint
         logger.info(f'Start iteration = {self.n_iter}')
 
-    @staticmethod
-    def convert_shared_tensors_to_cpu(state_dict):
-        for key, value in state_dict.items():
-            if isinstance(value, torch.Tensor) and value.is_shared():
-                state_dict[key] = value.cpu()  # Move shared tensor to CPU
-        return state_dict
-
     def save(self, save_path, suffix='') -> None:
         if save_path is not None:
             if suffix == '':
@@ -753,11 +711,10 @@ class Trainer:
             else:
                 save_path = f'{save_path}/model_{suffix}'
 
-            # self.model.load_state_dict(self.convert_shared_tensors_to_cpu(self.accelerator.get_state_dict(self.model)))
-            # self.optimizer.load_state_dict(self.convert_shared_tensors_to_cpu(self.optimizer.state_dict()))
-
-            # self.accelerator.save_state(f'{save_path}')
-            # self.accelerator.save_model(self.model, f'{save_path}')
+            # self.accelerator.save_state(f'{save_path}/accelerate_state')
+            os.makedirs(save_path, exist_ok=True)
+            unwrapped_model = self.accelerator.unwrap_model(self.model).cpu()
+            torch.save(unwrapped_model.state_dict(), f'{save_path}/model.pth')
             self.save_metrics(save_path)
 
             if self.accelerator.is_main_process:
@@ -767,14 +724,7 @@ class Trainer:
                     # 'optimizer_state_dict': self.optimizer.state_dict(),
                     'iteration': self.n_iter,
                     'epoch': self.n_epoch,
-                    'metrics': self.metrics
-                }
-                # unwrapped_model = self.accelerator.unwrap_model(self.model)
-                # torch.save(unwrapped_model.state_dict(), f'{save_path}/model.pth')
-                state_dict = self.accelerator.get_state_dict(self.model)
-                torch.save(state_dict, f'{save_path}/model.pth')
-
-                # unwrapped_model.save(f'{save_path}/model.pth', save_function=self.accelerator.save)
+                    'metrics': self.metrics}
                 # handled by accelerate
                 # if self.use_torch_amp:
                 #     to_save['torch_amp'] = self.amp_grad_scaler.state_dict()
@@ -794,8 +744,7 @@ class Trainer:
             trainer.save_metrics(save_path=args.model_path)
         """
         if save_path is not None:
-            save_path = Path(save_path) / 'metrics.json'
-            save_path.parent.mkdir(parents=True, exist_ok=True)
+            save_path = f'{save_path}/metrics.json'
             for split in self.metrics:
                 for k in self.metrics[split]:
                     if isinstance(self.metrics[split][k], torch.Tensor):

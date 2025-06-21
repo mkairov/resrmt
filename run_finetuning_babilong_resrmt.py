@@ -338,63 +338,41 @@ if __name__ == '__main__':
     if args.backbone_cpt:
         backbone_cpt = os.path.join(args.backbone_cpt, "pytorch_model.bin")
         model = torch.load(backbone_cpt, map_location='cpu')
-        cpt = torch.load(backbone_cpt, map_location='cpu')
-        model.load_state_dict(cpt, strict=False)
         logger.info(f'Loaded baseline state dict from: {args.backbone_cpt}')
 
     # Pass memory settings to pretrained model
     if args.num_mem_tokens is not None:
-        if args.no_memory_cell:
-            recurrent_wrapper_cls = get_cls_by_name(args.recurrent_wrapper_cls)
-            logger.info(f'Wrapping in: {recurrent_wrapper_cls}. No memory cell specified, assuming model takes num_mem_tokens argument')
-            max_n_segments = args.max_n_segments
-            if max_n_segments in {-1, None}:
-                max_n_segments = np.ceil(args.sample_size / args.segment_size)
+        mem_cell_args = dict(
+            base_model=model,
+        )
+        mem_cell_args["num_mem_tokens"] = args.num_mem_tokens
+        if args.layers_attr is not None:
+            mem_cell_args["layers_attr"] = args.layers_attr
+        if args.aggr_type is not None:
+            mem_cell_args["aggr_type"] = args.aggr_type
+        if args.aggr_pos_embed is not None:
+            mem_cell_args["aggr_pos_embed"] = args.aggr_pos_embed
+        if args.res_mem_count is not None:
+            mem_cell_args["res_mem_count"] = args.res_mem_count
 
-            model = recurrent_wrapper_cls(
-                model,
-                segment_size=args.segment_size,
-                max_n_segments=max_n_segments, 
-                segment_alignment=args.segment_alignment,
-                k2=args.k2,
-                skip_connection_length=args.skip_connection_length,
-                res_mem_count=args.res_mem_count
-            )
-
-        else:
-            mem_cell_args = dict(
-                base_model=model,
-            )
-            if args.num_mem_tokens is not None:
-                mem_cell_args["num_mem_tokens"] = args.num_mem_tokens
-            if args.memory_cell_cls == 'modeling_rmt.rmt_br:MemoryCell':
-                if args.layers_attr is not None:
-                    mem_cell_args["layers_attr"] = args.layers_attr
-                if args.aggr_type is not None:
-                    mem_cell_args["aggr_type"] = args.aggr_type
-                if args.aggr_pos_embed is not None:
-                    mem_cell_args["aggr_pos_embed"] = args.aggr_pos_embed
-                mem_cell_args["res_mem_count"] = args.res_mem_count
-
-            memory_cell_cls = get_cls_by_name(args.memory_cell_cls)
-            recurrent_wrapper_cls = get_cls_by_name(args.recurrent_wrapper_cls)
-            logger.info(f'Wrapping in: {memory_cell_cls} and {recurrent_wrapper_cls}')
-            cell = memory_cell_cls(**mem_cell_args)
-            if args.segment_alignment not in {None, 'left'}:
-                logger.info(f"Using custom segment alignment: {args.segment_alignment}")
-            
-            max_n_segments = args.max_n_segments
-            if max_n_segments in {-1, None}:
-                max_n_segments = np.ceil(args.sample_size / args.segment_size)
-            model = recurrent_wrapper_cls(
-                cell, 
-                segment_size=args.segment_size,
-                max_n_segments=max_n_segments, 
-                segment_alignment=args.segment_alignment,
-                k2=args.k2,
-                skip_connection_length=args.skip_connection_length,
-                res_mem_count=args.res_mem_count
-            )
+        memory_cell_cls = get_cls_by_name(args.memory_cell_cls)
+        recurrent_wrapper_cls = get_cls_by_name(args.recurrent_wrapper_cls)
+        logger.info(f'Wrapping in: {memory_cell_cls} and {recurrent_wrapper_cls}')
+        cell = memory_cell_cls(**mem_cell_args)
+        if args.segment_alignment not in {None, 'left'}:
+            logger.info(f"Using custom segment alignment: {args.segment_alignment}")
+        
+        max_n_segments = args.max_n_segments
+        if max_n_segments in {-1, None}:
+            max_n_segments = np.ceil(args.sample_size / args.segment_size)
+        model = recurrent_wrapper_cls(
+            cell, 
+            segment_size=args.segment_size,
+            max_n_segments=max_n_segments, 
+            segment_alignment=args.segment_alignment,
+            k2=args.k2,
+            res_mem_count=args.res_mem_count
+        )
                                     
 
         ## load cpt of rmt
@@ -430,10 +408,7 @@ if __name__ == '__main__':
     logger.info(f'Using optimizer class: {optimizer_cls}')
 
     # todo: group optimizer params
-    if args.lr_schedule_free:
-        optimizer = optimizer_cls(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, warmup_steps=args.num_warmup_steps)
-    else:
-        optimizer = optimizer_cls(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = optimizer_cls(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         
     # if args.model_cpt or args.backbone_cpt:
     #     optimizer.load_state_dict(cpt['optimizer_state_dict'])

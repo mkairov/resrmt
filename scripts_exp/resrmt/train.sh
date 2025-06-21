@@ -1,25 +1,21 @@
 #!/usr/bin/env bash
-# CUDA_VISIBLE_DEVICES=0 NP=1 ./finetune_babilong_baseline.sh
 set -e
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-# cd ../..
-CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:2
+export CUDA_LAUNCH_BLOCKING=1
 NP=1
-CUBLAS_WORKSPACE_CONFIG=:4096:2
-CUDA_LAUNCH_BLOCKING=1
 
 MODEL_TYPE=decoder
 BACKBONE_CLS=transformers:AutoModelForCausalLM
 NOISE_DATASET=pg19
 METRIC=exact_match
-POSTFIX=teacher-forcing
-# POSTFIX=gen-valid
 OVERWRITE_RUNS=1
 
 # for LAST_ARG in "" "--sep_seg_q"; do
 
-for MODEL_KIND in rmt-br; do
+for MODEL_KIND in rmt-ms; do
 
 if [ $MODEL_KIND = "rmt" ]; then
     MEMORY_CELL=modeling_rmt.language_modeling:MemoryCell
@@ -27,13 +23,16 @@ if [ $MODEL_KIND = "rmt" ]; then
 elif [ $MODEL_KIND = "resrmt" ]; then
     MEMORY_CELL=modeling_rmt.resrmt:MemoryCell
     RECURRENT_WRAPPER=modeling_rmt.resrmt:RecurrentWrapper
-elif [ $MODEL_KIND = "bwrmt" ]; then
-    BACKBONE_CLS=modeling_rmt.block_resrmt:GPT2ModelWithBlockWiseMemory
-    MEMORY_CELL="none --no_memory_cell"
-    RECURRENT_WRAPPER=modeling_rmt.block_resrmt:RecurrentWrapper
+# elif [ $MODEL_KIND = "bwrmt" ]; then
+#     BACKBONE_CLS=modeling_rmt.block_resrmt:GPT2ModelWithBlockWiseMemory
+#     MEMORY_CELL="none --no_memory_cell"
+#     RECURRENT_WRAPPER=modeling_rmt.block_resrmt:RecurrentWrapper
 elif [ $MODEL_KIND = "rmt-br" ]; then
     MEMORY_CELL=modeling_rmt.rmt_br:MemoryCell
     RECURRENT_WRAPPER=modeling_rmt.rmt_br:RecurrentWrapper
+elif [ $MODEL_KIND = "rmt-ms" ]; then
+    MEMORY_CELL=modeling_rmt.rmt_ms:MemoryCell
+    RECURRENT_WRAPPER=modeling_rmt.rmt_ms:RecurrentWrapper
 else
     echo Model $MODEL_KIND not found, aborting
     exit 1
@@ -41,7 +40,7 @@ fi
 
 MODEL_NAME=gpt2  # backbone model
     
-ITERS=25000
+ITERS=1000
 
 for TASK_DATASET in qa1_single-supporting-fact; do
 # for TASK_DATASET in qa2_two-supporting-facts; do
@@ -54,8 +53,8 @@ for LR in 1e-05; do
 
 TBS=64
 for SEGMENT_SIZE in 128; do
-MAX_N_SEGMENTSS=(0 1 3)
-BSS=(0 16 8)
+MAX_N_SEGMENTSS=(0 0 1)
+BSS=(0 0 16)
 
 for (( j=2; j<${#MAX_N_SEGMENTSS[@]}; j++ )); do
 
@@ -87,16 +86,17 @@ K2=-1 # BPTT unroll length
 NP=$NP  
 ACCEL_CONFIG=/data/home/admin/rmt/accel_configs/exp/accelerate/deepspeed_bf16_tbs${TBS}bs${BS}g${GRAD_ACC_STEPS}c1.0np${NP}.yaml
 cd accel_configs/
-python create_config2.py \
+python create_config.py \
         --bf16 \
         --train_batch_size $TBS \
         --train_micro_batch_size_per_gpu $BS \
         --gradient_accumulation_steps $GRAD_ACC_STEPS \
         --np $NP \
-        --gradient_clipping 1.0
+        --gradient_clipping 1.0 \
+        --prefix deepspeed
 cd ..
 
-MODEL_PATH="/data/home/admin/rmt/runs/${TASK_DATASET}/${MODEL_NAME}/${MODEL_KIND}/${SCHEDULER}_adamw_wd1e-03_${MAX_N_SEGMENTS}x${SEGMENT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_bptt-${K2}_from_cpt_${SRC_N_SEGMENTS}-${MAX_N_SEGMENTS}_${POSTFIX}/run_${N}"
+MODEL_PATH="/data/home/admin/rmt/runs/${TASK_DATASET}/${MODEL_NAME}/${MODEL_KIND}/${SCHEDULER}_adamw_wd1e-03_${MAX_N_SEGMENTS}x${SEGMENT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_bptt-${K2}_from_cpt_${SRC_N_SEGMENTS}-${MAX_N_SEGMENTS}/run_${N}"
 
 if [ ! -d $MODEL_PATH -o $OVERWRITE_RUNS -eq 1 ]; then
 
@@ -104,7 +104,7 @@ echo RUNNING: MODEL_KIND $MODEL_KIND TASK_DATASET $TASK_DATASET MEMORY_SIZE $MEM
 echo SAMPLE_SIZE $SAMPLE_SIZE MODEL_NAME $MODEL_NAME LR $LR N $N
 echo gradient accumulation steps $GRAD_ACC_STEPS
 
-MODEL_CPT="/data/home/admin/rmt/runs/${TASK_DATASET}/${MODEL_NAME}/${MODEL_KIND}/${SCHEDULER}_adamw_wd1e-03_${SRC_N_SEGMENTS}x${SEGMENT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_bptt-${K2}_from_cpt_${SRC_SRC_N_SEGMENTS}-${SRC_N_SEGMENTS}_${POSTFIX}/run_${N}/model_best"
+MODEL_CPT="/data/home/admin/rmt/runs/${TASK_DATASET}/${MODEL_NAME}/${MODEL_KIND}/${SCHEDULER}_adamw_wd1e-03_${SRC_N_SEGMENTS}x${SEGMENT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_bptt-${K2}_from_cpt_${SRC_SRC_N_SEGMENTS}-${SRC_N_SEGMENTS}/run_${N}/model_best"
 
 if [ ! -d $MODEL_CPT ]; then
     echo checkpoint not found, training from scratch
@@ -145,7 +145,8 @@ accelerate launch --config_file $ACCEL_CONFIG --main_process_port 29007 run_fine
         --optimize_metric $METRIC --optimize_mode max --best_metric_value 1.0 \
         --show_valid_examples 5 \
         --seed $(($N+42)) \
-        --clip_grad_norm 1.0 --max_n_facts 50 --early_stopping_patience 25 --aggr_type full --freeze_model_weights
+        --layers_attr transformer.h \
+        --clip_grad_norm 1.0 --max_n_facts 50 --early_stopping_patience 25 --aggr_type full
 else
 
 echo run $MODEL_PATH exists already, delete the previous run or ser OVERWRITE_RUNS to 0
