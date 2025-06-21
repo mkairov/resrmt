@@ -5,20 +5,51 @@ import torch
 from torch import nn
 
 from lm_experiments_tools.utils import RMTOutput
+from modeling_rmt.rmt_br import MemoryAttention, GPTMemoryAttention, GPTMemoryFullAttention, apply_rope_with_segments
 
 
 class MemoryCell(torch.nn.Module):
-    def __init__(self, base_model, num_mem_tokens, **kwargs):
+    def __init__(self, base_model, num_mem_tokens, res_mem_count=0, layers_attr='transformers.h', aggr_type='mem_attn', aggr_pos_embed='rope', **kwargs):
         super().__init__()
         self.model = base_model
         self.num_mem_tokens = num_mem_tokens
-        self.create_memory(num_mem_tokens)
+        self.res_mem_count = res_mem_count
 
-    def create_memory(self, num_mem_tokens):
-        self.num_mem_tokens = num_mem_tokens
-        embeddings = self.model.get_input_embeddings()
-        memory_dim =  getattr(self.model.config, 'n_embd', self.model.config.hidden_size)
-        memory_weights = torch.randn((num_mem_tokens, memory_dim)) * embeddings.weight.data.std()
+        memory_dim = self.model.config.hidden_size
+        embd_std = self.model.get_input_embeddings().weight.data.std().cpu().item()
+        self.create_memory(num_mem_tokens, memory_dim, embd_std)
+
+        layers = self.model
+        layers_attrs = layers_attr.split('.')
+        for i, attr in enumerate(layers_attrs):
+            layers = getattr(layers, attr)
+        layer = layers[0]
+
+        self.memory_state = None
+        if self.res_mem_count not in {0, None}:
+            if aggr_type in ('mem_attn', None):
+                self.aggregator = MemoryAttention(memory_dim=memory_dim, res_mem_count=res_mem_count)
+            elif aggr_type == 'layer':
+                self.aggregator = GPTMemoryAttention(layer, d_model=memory_dim, res_mem_count=res_mem_count)
+            elif aggr_type == 'full':
+                self.aggregator = GPTMemoryFullAttention(layer, num_mem_tokens=num_mem_tokens, res_mem_count=res_mem_count)
+            elif aggr_type == 'shared':
+                self.aggregator = kwargs.get('aggr_layer')
+        else:
+            self.aggregator = None
+        self.past_memory_states = []
+
+        if aggr_pos_embed == 'rope':
+            self.pos_embed_func = apply_rope_with_segments
+        elif aggr_pos_embed == 'sin':
+            self.pos_embed_func = lambda x, y: x
+        elif aggr_pos_embed == 'none':
+            self.pos_embed_func = lambda x, y: x
+        
+        self.seg_num = 0
+
+    def create_memory(self, num_mem_tokens, memory_dim, embd_std):
+        memory_weights = torch.randn((num_mem_tokens, memory_dim)) * embd_std
         self.register_parameter('memory', torch.nn.Parameter(memory_weights, requires_grad=True))
 
         self.read_memory_position = range(num_mem_tokens)
@@ -28,23 +59,34 @@ class MemoryCell(torch.nn.Module):
         memory = self.memory.repeat(input_shape[0], 1, 1)
         return memory
 
-    def forward(self, input_ids, memory_state=None, **kwargs):
-        if memory_state is None:
-            memory_state = self.set_memory(input_ids.shape)
+    def forward(self, input_ids, **kwargs):
+        if self.num_mem_tokens > 0 and self.memory_state is not None and self.aggregator is not None:
+            memory_pos_embeds = self.pos_embed_func(self.memory_state, self.seg_num).type_as(self.memory_state)
+            self.past_memory_states.append(memory_pos_embeds)
+            self.memory_state = self.aggregator(memory_pos_embeds, self.past_memory_states)
 
-        seg_kwargs = self.process_input(input_ids, memory_state, write_mem=True, **kwargs)
+        self.seg_num += 1
+
+        if self.memory_state is None:
+            self.memory_state = self.set_memory(input_ids.shape)
+
+        seg_kwargs = self.process_input(input_ids, self.memory_state, write_mem=True, **kwargs)
         out = self.model(**seg_kwargs)
-        out, new_memory_state = self.process_output(out, **kwargs)
+        out, self.memory_state = self.process_output(out, **kwargs)
 
-        return out, new_memory_state
+        return out
     
-    def generate(self, input_ids, memory_state, attention_mask=None, **generate_kwargs):
-        if memory_state is None:
-            memory_state = self.set_memory(input_ids.shape)
+    def generate(self, input_ids, attention_mask=None, **generate_kwargs):
+        if self.memory_state is None:
+            self.memory_state = self.set_memory(input_ids.shape)
 
-        seg_kwargs = self.process_input(input_ids, memory_state, attention_mask=attention_mask, write_mem=False)
+        seg_kwargs = self.process_input(input_ids, self.memory_state, attention_mask=attention_mask, write_mem=False)
         out = self.model.generate(inputs_embeds=seg_kwargs['inputs_embeds'], attention_mask=seg_kwargs['attention_mask'], **generate_kwargs)
         return out
+    
+    def reset_memory(self):
+        self.memory_state = None
+        self.past_memory_states.clear()
 
     def process_input(self, input_ids, memory_state, write_mem, **kwargs):
         seg_kwargs = dict(**kwargs)
@@ -91,58 +133,6 @@ class MemoryCell(torch.nn.Module):
         return out, memory_state 
 
 
-class MemoryAttention(torch.nn.Module):
-    def __init__(self, memory_dim, res_mem_count, hidden_dim=None, num_heads=1, embd_std=0.02):
-        super().__init__()
-        if hidden_dim is None:
-            hidden_dim = memory_dim * 4
-
-        self.memory_dim = memory_dim
-        self.res_mem_count = res_mem_count
-        self.attention = torch.nn.MultiheadAttention(embed_dim=memory_dim, num_heads=num_heads, batch_first=True)
-        self.feedforward = torch.nn.Sequential(
-            torch.nn.Linear(memory_dim, hidden_dim),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden_dim, memory_dim)
-        )
-        self.norm1 = torch.nn.LayerNorm(memory_dim)
-        self.norm2 = torch.nn.LayerNorm(memory_dim)
-
-        self._init_weights(embd_std)
-
-    def _init_weights(self, embd_std):
-        for n, p in self.named_parameters():
-            if "weight" in n:
-                if "attention" in n:
-                    nn.init.normal_(p, mean=0.0, std=embd_std)
-                elif "norm" in n:
-                    nn.init.ones_(p)
-                else:
-                    nn.init.xavier_uniform_(p)
-            elif "bias" in n:
-                nn.init.zeros_(p)
-
-    def forward(self, current_memory, prev_memories):
-        if len(prev_memories) == 0 or self.res_mem_count == 0:
-            return current_memory
-        
-        elif self.res_mem_count > 0:
-            memory_dropout = random.sample(prev_memories, min(len(prev_memories), self.res_mem_count))
-            memory_cat = torch.cat(memory_dropout, dim=1)
-            attn_output, attn_map = self.attention(query=current_memory, key=memory_cat, value=memory_cat) # K [memory_dim, n_tokens * n_memory] @ V^T
-
-        else:
-            memory_cat = torch.cat(prev_memories, dim=1)
-            attn_output, attn_map = self.attention(query=current_memory, key=memory_cat, value=memory_cat)
-
-        updated_memory = current_memory + attn_output 
-        updated_memory = self.norm1(updated_memory)
-        updated_memory = updated_memory + self.feedforward(updated_memory)
-        updated_memory = self.norm2(updated_memory)
-
-        return updated_memory
-
-
 def apply_rope_with_segments(memory_state, segment_num):
     batch_size, seq_length, d_model = memory_state.shape
 
@@ -167,52 +157,31 @@ class RecurrentWrapper(torch.nn.Module):
         self.memory_cell = memory_cell
         self.rmt_config = rmt_kwargs
 
-        memory_dim = self.memory_cell.memory.shape[-1]
-
-        self.res_mem_count = rmt_kwargs.get("res_mem_count")
-        if self.res_mem_count not in {0, None}:
-            self.memory_aggregator = MemoryAttention(memory_dim, res_mem_count=rmt_kwargs.get('res_mem_count'))
-        else:
-            self.aggregator = None
-
     def forward(self, input_ids, labels=None, labels_mask=None, inputs_embeds=None, attention_mask=None, output_attentions=False, output_hidden_states=True):
-        memory_state = None
         segmented = self.segment(input_ids=input_ids, inputs_embeds=inputs_embeds, attention_mask=attention_mask)
-
+        
         cell_outputs = []
-        past_memory_states = []
-        for seg_num, segment in enumerate(segmented):
-            cell_out, memory_state = self.memory_cell(**segment, memory_state=memory_state, output_hidden_states=output_hidden_states, output_attentions=output_attentions)
+        self.memory_cell.reset_memory()
+        for _, segment in enumerate(segmented):
+            
+            cell_out = self.memory_cell(**segment, output_hidden_states=output_hidden_states, output_attentions=output_attentions)
             cell_outputs.append(cell_out)
-
-            if self.memory_cell.num_mem_tokens > 0 and self.aggregator is not None:
-                memory_pos_embeds = apply_rope_with_segments(memory_state, seg_num).type_as(memory_state)
-                past_memory_states.append(memory_pos_embeds)
-                memory_state = self.aggregator(memory_pos_embeds, past_memory_states)
-                memory_state = self.manage_gradients(memory_state, seg_num)
 
         out = self.process_outputs(cell_outputs, labels=labels, 
                                    labels_mask=labels_mask,
                                    output_attentions=output_attentions, 
                                    output_hidden_states=output_hidden_states)
-        past_memory_states.clear()
-        
         return out
     
     def generate(self, input_ids, attention_mask=None, **generate_kwargs):
-        memory_state = None
         segmented = self.segment(input_ids=input_ids, attention_mask=attention_mask)
+        self.memory_cell.reset_memory()
 
-        past_memory_states = []
-        for seg_num, segment in enumerate(segmented[:-1]):
-            _, memory_state = self.memory_cell(**segment, memory_state=memory_state, output_hidden_states=True)
-            memory_state = apply_rope_with_segments(memory_state, seg_num)
-            past_memory_states.append(memory_state)
-            memory_state = self.memory_aggregator(memory_state, past_memory_states)
+        for _, segment in enumerate(segmented[:-1]):
+            self.memory_cell(**segment, output_hidden_states=True)
 
         final_segment = segmented[-1]
-        out = self.memory_cell.generate(**final_segment, memory_state=memory_state, **generate_kwargs)
-        past_memory_states.clear()
+        out = self.memory_cell.generate(**final_segment, **generate_kwargs)
 
         return out
 

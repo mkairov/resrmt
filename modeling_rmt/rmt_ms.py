@@ -5,6 +5,9 @@ from torch import nn
 from lm_experiments_tools.utils import RMTOutput
 from modeling_rmt.rmt_br import MemoryAttention, GPTMemoryAttention, GPTMemoryFullAttention, apply_rope_with_segments
 
+from accelerate.logging import get_logger
+logger = get_logger('')
+
 class MemoryLayerWrapper(nn.Module):
     def __init__(self, layer, num_mem_tokens, memory_dim, res_mem_count=-1, embd_std=0.02, aggr_type='mem_attn', aggr_pos_embed='rope', **kwargs):
         super().__init__()
@@ -70,15 +73,20 @@ class MemoryLayerWrapper(nn.Module):
             else:
                 prev_layer_memory = self.prev_layer.memory_state
 
+            # logger.info(hidden_states.device)
+            # logger.info(self.memory_state.device)
+
             if not self.generate_mode:
-                hidden_states = hidden_states[:, self.num_mem_tokens * 2:-self.num_mem_tokens, :]
-                hidden_states = torch.cat([self.memory_state, prev_layer_memory, hidden_states, self.memory_state], dim=1)
+                hidden_states = hidden_states[:, self.num_mem_tokens:-self.num_mem_tokens, :]
+                hidden_states = torch.cat([self.memory_state, hidden_states, prev_layer_memory], dim=1)
             elif self.first_segment:
-                # self.first_segment = False
-                hidden_states = hidden_states[:, self.num_mem_tokens * 2:]
-                hidden_states = torch.cat([self.memory_state, prev_layer_memory, hidden_states], dim=1)
+                self.first_segment = False
+                hidden_states = hidden_states[:, self.num_mem_tokens:]
+                hidden_states = torch.cat([self.memory_state, hidden_states], dim=1)
         
-        print(self.seg_num, 'after', hidden_states.shape)
+        # logger.info(hidden_states.device)
+        # logger.info(attention_mask.device)
+        
         out = self.layer(hidden_states=hidden_states, attention_mask=attention_mask, **kwargs)
         if self.num_mem_tokens > 0:
             self.memory_state = out[0][:, -self.num_mem_tokens:]
@@ -114,7 +122,7 @@ class MemoryCell(nn.Module):
                 num_mem_tokens=num_mem_tokens,
                 memory_dim=self.model.config.hidden_size,
                 res_mem_count=res_mem_count,
-                embd_std=self.model.get_input_embeddings().weight.data.std(),
+                embd_std=self.model.get_input_embeddings().weight.data.std().cpu().item(),
                 aggr_type=aggr_type,
                 aggr_pos_embed=aggr_pos_embed,
                 **kwargs
@@ -124,9 +132,16 @@ class MemoryCell(nn.Module):
             self.layers[i].prev_layer = self.layers[i - 1]
 
     def forward(self, input_ids, **kwargs):
+        for i in range(1, len(self.layers)):
+            self.layers[i].prev_layer = self.layers[i - 1]
+
         seg_kwargs = self.process_input(input_ids, write_mem=True, **kwargs)
         out = self.model(**seg_kwargs)
         out = self.process_output(out, **kwargs)
+
+        for i in range(1, len(self.layers)):
+            self.layers[i].prev_layer = None
+
         return out
     
     def reset_memory(self):
@@ -149,8 +164,9 @@ class MemoryCell(nn.Module):
         seg_kwargs = dict(**kwargs)
 
         inputs_embeds = kwargs.get('inputs_embeds', None)
+        device = next(self.parameters()).device
         if inputs_embeds is None:
-            inputs_embeds = self.model.get_input_embeddings()(input_ids)
+            inputs_embeds = self.model.get_input_embeddings()(input_ids.to(device))
         
         if self.num_mem_tokens > 0:
             blank_tokens = torch.zeros((inputs_embeds.shape[0], self.num_mem_tokens, inputs_embeds.shape[2]), dtype=inputs_embeds.dtype, device=inputs_embeds.device)
@@ -162,7 +178,7 @@ class MemoryCell(nn.Module):
         seg_kwargs['input_ids'] = None
         seg_kwargs['inputs_embeds'] = inputs_embeds
         if kwargs.get('attention_mask') is not None:
-            seg_kwargs['attention_mask'] = self.pad_attention_mask(kwargs['attention_mask'], inputs_embeds.shape)
+            seg_kwargs['attention_mask'] = self.pad_attention_mask(kwargs['attention_mask'], inputs_embeds.shape).to(device)
             # seg_kwargs['attention_mask'] = kwargs.get('attention_mask')
         seg_kwargs['output_hidden_states'] = True
         return seg_kwargs
