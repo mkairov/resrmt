@@ -4,7 +4,7 @@ from torch.nn import CrossEntropyLoss
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 import transformers
 class MemoryCell(torch.nn.Module):
-    def __init__(self, base_model, num_mem_tokens):
+    def __init__(self, base_model, num_mem_tokens, **kwargs):
         super().__init__()
         self.model = base_model
         self.create_memory(num_mem_tokens)
