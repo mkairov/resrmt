@@ -683,7 +683,7 @@ class Trainer:
         if not reset_iteration:
             self.n_iter = trainer_state.get('iteration', 0) + 1  # as saved iteration is already performed
             self.n_epoch = trainer_state.get('epoch', 0)
-
+        load_only_model_ckpt = True
         if not load_only_model_ckpt:
             logger.info('Loading model, trainer, and accelerate state')
             self.accelerator.load_state(load_path / 'accelerate_state')
