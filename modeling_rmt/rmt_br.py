@@ -173,7 +173,6 @@ class MemoryLayerWrapper(nn.Module):
 
     def create_memory(self, memory_dim, num_mem_tokens, embd_std):
         memory_weights = torch.randn((num_mem_tokens, memory_dim)) * embd_std
-        # memory_weights = torch.zeros((num_mem_tokens, memory_dim))
         self.register_parameter('memory', torch.nn.Parameter(memory_weights, requires_grad=True))
 
         self.read_memory_position = range(num_mem_tokens)
@@ -215,7 +214,8 @@ class MemoryLayerWrapper(nn.Module):
 
 
 class MemoryCell(nn.Module):
-    def __init__(self, base_model, num_mem_tokens, res_mem_count=-1, layers_attr: str = 'transformer.h', aggr_type='mem_attn', aggr_pos_embed='rope'):
+    def __init__(self, base_model, num_mem_tokens: int, res_mem_count: int = -1,
+                 layers_attr: str = 'transformer.h', aggr_type: str = 'mem_attn', aggr_pos_embed: str = 'rope'):
         super().__init__()
         self.model = base_model
         self.num_mem_tokens = num_mem_tokens

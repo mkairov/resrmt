@@ -2,18 +2,18 @@
 set -e
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=1
 export CUBLAS_WORKSPACE_CONFIG=:4096:2
 export CUDA_LAUNCH_BLOCKING=1
-NP=2
+NP=1
 
 MODEL_TYPE=decoder
 BACKBONE_CLS=transformers:AutoModelForCausalLM
 NOISE_DATASET=pg19
 METRIC=exact_match
-OVERWRITE_RUNS=1
+OVERWRITE_RUNS=0
 
-for MODEL_KIND in armt; do
+for MODEL_KIND in resrmt; do
 
 if [ $MODEL_KIND = "rmt" ]; then
     MEMORY_CELL=modeling_rmt.language_modeling:MemoryCell
@@ -48,43 +48,45 @@ for TASK_DATASET in qa1_single-supporting-fact; do
 # for TASK_DATASET in qa3_three-supporting-facts; do
 # for TASK_DATASET in qa4_two-arg-relations; do
 
-# for TASK_DATASET in qa1_single-supporting-fact qa3_three-supporting-facts qa4_two-arg-relations; do
+# for TASK_DATASET in qa3_three-supporting-facts; do
 
-for LR in 1e-04; do
+for LR in 1e-05; do
 
 TBS=64
 for SEGMENT_SIZE in 128; do
-MAX_N_SEGMENTSS=(0 0 4)
-BSS=(0 0 4)
 
-for (( j=2; j<${#MAX_N_SEGMENTSS[@]}; j++ )); do
+SRC_N_SEGMENTSS=(0 3)
 
-MAX_N_SEGMENTS=${MAX_N_SEGMENTSS[j]} 
-BS=${BSS[j]}
+for (( j=1; j<${#SRC_N_SEGMENTSS[@]}; j++ )); do
+
+SRC_N_SEGMENTS=${SRC_N_SEGMENTSS[j]}
 
 j1=$((j-1))
-SRC_N_SEGMENTS=${MAX_N_SEGMENTSS[j1]}
+SRC_SRC_N_SEGMENTS=${SRC_N_SEGMENTSS[j1]}
+echo SRC_N_SEGMENTS $SRC_N_SEGMENTS SRC_SRC_N_SEGMENTS $SRC_SRC_N_SEGMENTS
 
-j2=$((j-2))
-SRC_SRC_N_SEGMENTS=${MAX_N_SEGMENTSS[j2]}
+for N in paper_run1 paper_run2 lr5_paper_run1 lr5_paper_run2; do
+# for N in paper_run_cur1 paper_run_cur2 lr5_paper_run_cur1 lr5_paper_run_cur2; do
+# for N in paper_run_cur1 lr5_paper_run_cur1; do
+SCHEDULER=linear
+MEMORY_SIZE=16
+for RES_MEM_COUNT in 0; do
+K2=-1 # BPTT unroll length
 
-if [ $MAX_N_SEGMENTS -ne 0 ]; then
 
-for MEMORY_SIZE in 16; do
+MODEL_CPT="/data/home/admin/rmt/runs/${TASK_DATASET}/${MODEL_NAME}/${MODEL_KIND}/${SCHEDULER}_adamw_wd1e-03_${SRC_N_SEGMENTS}x${SEGMENT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_bptt-${K2}_from_cpt_${SRC_SRC_N_SEGMENTS}-${SRC_N_SEGMENTS}/run_${N}/model_best"
+
+echo looking for checkpoint
+echo $MODEL_CPT
+
+if [ -d $MODEL_CPT ]; then
+
+for MAX_N_SEGMENTS in 1 2 4 8 16 32; do
 
 SAMPLE_SIZE=$((MAX_N_SEGMENTS*SEGMENT_SIZE)) # length of task sample in tokens
 
-GRAD_ACC_STEPS=$(($TBS/($BS*$NP)))
-
-SCHEDULER=linear
-OPTIMIZER=AdamW
-WEIGHT_DECAY=1e-02
-
-for RES_MEM_COUNT in 0; do
-
-for N in crepe; do
-
-K2=-1 # BPTT unroll length
+BS=$((64/$MAX_N_SEGMENTS))
+GRAD_ACC_STEPS=$(($TBS/$BS))
 
 NP=$NP  
 ACCEL_CONFIG=/data/home/admin/rmt/accel_configs/exp/accelerate/deepspeed_bf16_tbs${TBS}bs${BS}g${GRAD_ACC_STEPS}c1.0np${NP}.yaml
@@ -99,7 +101,7 @@ python create_config.py \
         --prefix deepspeed
 cd ..
 
-MODEL_PATH="/data/home/admin/rmt/runs/${TASK_DATASET}/${MODEL_NAME}/${MODEL_KIND}/lr${LR}_${SCHEDULER}_${OPTIMIZER}_wd${WEIGHT_DECAY}_${MAX_N_SEGMENTS}x${SEGMENT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_bptt-${K2}_from_cpt_${SRC_N_SEGMENTS}-${MAX_N_SEGMENTS}/run_${N}"
+MODEL_PATH="/data/home/admin/rmt/runs/${TASK_DATASET}/${MODEL_NAME}/${MODEL_KIND}/eval/${SCHEDULER}_adamw_wd1e-03_${MAX_N_SEGMENTS}x${SEGMENT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_bptt-${K2}_from_cpt_${SRC_N_SEGMENTS}-${MAX_N_SEGMENTS}/run_${N}"
 
 if [ ! -d $MODEL_PATH -o $OVERWRITE_RUNS -eq 1 ]; then
 
@@ -107,21 +109,14 @@ echo RUNNING: MODEL_KIND $MODEL_KIND TASK_DATASET $TASK_DATASET MEMORY_SIZE $MEM
 echo SAMPLE_SIZE $SAMPLE_SIZE MODEL_NAME $MODEL_NAME LR $LR N $N
 echo gradient accumulation steps $GRAD_ACC_STEPS
 
-MODEL_CPT="/data/home/admin/rmt/runs/${TASK_DATASET}/${MODEL_NAME}/${MODEL_KIND}/lr${LR}_${SCHEDULER}_${OPTIMIZER}_wd${WEIGHT_DECAY}_${SRC_N_SEGMENTS}x${SEGMENT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_bptt-${K2}_from_cpt_${SRC_SRC_N_SEGMENTS}-${SRC_N_SEGMENTS}/run_${N}/model_best"
+echo checkpoint found
 
-if [ ! -d $MODEL_CPT ]; then
-    echo checkpoint not found, training from scratch
-    MODEL_CPT=""
-else
-    echo checkpoint found
-    MODEL_CPT="--model_cpt ${MODEL_CPT}"
-fi
-
-accelerate launch --config_file $ACCEL_CONFIG --main_process_port 29006 run_finetuning_babilong_resrmt.py \
+accelerate launch --config_file $ACCEL_CONFIG --main_process_port 29001 run_finetuning_babilong_resrmt.py \
         --task_dataset $TASK_DATASET \
         --noise_dataset $NOISE_DATASET \
         --babi_path /data/home/admin/rmt/data/tasks_1-20_v1-2/en-10k \
-        --model_path $MODEL_PATH $MODEL_CPT \
+        --model_path $MODEL_PATH \
+        --model_cpt $MODEL_CPT \
         --from_pretrained $MODEL_NAME \
         --model_type $MODEL_TYPE \
         --memory_cell_cls $MEMORY_CELL \
@@ -141,7 +136,7 @@ accelerate launch --config_file $ACCEL_CONFIG --main_process_port 29006 run_fine
         --reset_optimizer --reset_lr --reset_iteration \
         --save_best \
         --k2 $K2 \
-        --optimizer $OPTIMIZER --weight_decay $WEIGHT_DECAY \
+        --optimizer AdamW --weight_decay 0.01 \
         --lr ${LR} --lr_scheduler $SCHEDULER --num_warmup_steps $(($ITERS / 10)) \
         --data_n_workers 2 \
         --log_interval 25 --valid_interval 100 \
@@ -150,24 +145,28 @@ accelerate launch --config_file $ACCEL_CONFIG --main_process_port 29006 run_fine
         --seed $(($N+42)) \
         --layers_attr transformer.h \
         --d_mem 64 \
-        --clip_grad_norm 1.0 --max_n_facts 15 --early_stopping_patience 25 --aggr_type full
+        --validate_only \
+        --clip_grad_norm 1.0 \
+        --max_n_facts 15 \
+        --early_stopping_patience 25 \
+        --aggr_type full
+
 else
-
 echo run $MODEL_PATH exists already, delete the previous run or ser OVERWRITE_RUNS to 0
+fi
 
+done
+
+else
+echo checkpoint not found, validation skipped
 fi
 
 done
 done
 done
-
-fi
-
 done
 done
 done
 done
-done
-# done
 
 echo done

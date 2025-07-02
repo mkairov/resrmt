@@ -101,7 +101,7 @@ class MemoryLayerWrapper(nn.Module):
 
 
 class MemoryCell(nn.Module):
-    def __init__(self, base_model, num_mem_tokens, res_mem_count=-1, layers_attr: str = 'transformer.h', aggr_type='mem_attn', aggr_pos_embed='rope'):
+    def __init__(self, base_model, num_mem_tokens, res_mem_count=-1, layers_attr: str = 'transformer.h', aggr_type='mem_attn', aggr_pos_embed='rope', **kwargs):
         super().__init__()
         self.model = base_model
         self.num_mem_tokens = num_mem_tokens

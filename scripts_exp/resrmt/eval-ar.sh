@@ -3,7 +3,7 @@
 set -e
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 export CUBLAS_WORKSPACE_CONFIG=:4096:2
 export CUDA_LAUNCH_BLOCKING=1
 NP=1
@@ -15,7 +15,7 @@ BACKBONE_CLS=base_models.modeling_gpt_neox:GPTNeoXForCausalLM
 TASK_NAME=associative_retrieval
 METRIC=exact_match
 
-for MODEL_KIND in rmt-ms; do
+for MODEL_KIND in resrmt armt rmt-ms; do
 # for MODEL_KIND in rmt-br rmt-ms; do
 
 if [ $MODEL_KIND = "rmt" ]; then
@@ -52,16 +52,21 @@ for MEMORY_SIZE in 4; do
 TBS=128
 INPUT_SIZE=2048
 
-NUMS_PAIRS=(10)
-KEY_SIZES=(2)
-VALUE_SIZES=(1)
-BSS=(128)
-ITERSS=(10000)
+NUMS_PAIRS=(1 5 10 20 30 40 50)
+KEY_SIZES=(2 2 2 2 2 2 2)
+VALUE_SIZES=(1 1 1 1 1 1 1)
+BSS=(128 128 128 128 64 64 64)
+
+# NUMS_PAIRS=(30)
+# KEY_SIZES=(2)
+# VALUE_SIZES=(1)
+# BSS=(128)
 
 DIM=128
 NUM_LAYERS=4
 
-for N in crepe; do
+# for N in paper_ar_cur1 paper_ar_cur2; do
+for N in paper_ar21 paper_ar22; do
 
 for (( j=0; j<${#NUMS_PAIRS[@]}; j++ ))
 do
@@ -70,7 +75,12 @@ KEY_SIZE=${KEY_SIZES[j]}
 VALUE_SIZE=${VALUE_SIZES[j]}
 MAX_N_SEGMENTS=$((NUM_PAIRS + 1))
 BS=${BSS[j]}
-ITERS=${ITERSS[j]}
+ITERS=1
+
+PREV_KEY_SIZE=2
+PREV_VALUE_SIZE=1
+PREV_NUM_PAIRS=10
+PREV_MAX_N_SEGMENTS=$((PREV_NUM_PAIRS + 1))
 
 
 BLOCK_SIZE=$((KEY_SIZE + VALUE_SIZE + 2))
@@ -101,15 +111,6 @@ else
     REWRITE_FLAG=""
 fi
 
-# if [[ j -gt 0 ]]
-# then
-#     PREV_NUM_PAIRS=${NUMS_PAIRS[j-1]}
-#     PREV_MAX_N_SEGMENTS=$((PREV_NUM_PAIRS + 1))
-#     MODEL_CPT=../runs/${TASK_NAME}/${TASK_TYPE}/${MODEL_NAME}/${MODEL_KIND}/lr${LR}_${SCHEDULER}_adamw_wd1e-03_k${KEY_SIZES[j-1]}-v${VALUE_SIZES[j-1]}-p${PREV_NUM_PAIRS}-${PREV_MAX_N_SEGMENTS}x${INPUT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_${SEGMENT_ORDERING}_bptt-${PREV_MAX_N_SEGMENTS}_${NUM_LAYERS}l${NUM_LAYERS}hd${DIM}/run_$N 
-# else
-#     MODEL_CPT=None
-# fi
-
 GRAD_ACC_STEPS=$(($TBS/($BS*$NP)))
 ACCEL_CONFIG=/data/home/admin/rmt/accel_configs/exp/accelerate/deepspeed_bf16_tbs${TBS}bs${BS}g${GRAD_ACC_STEPS}c1.0np${NP}.yaml
 cd accel_configs/
@@ -123,7 +124,8 @@ python create_config.py \
         --prefix deepspeed
 cd ..
 
-MODEL_PATH="/data/home/admin/rmt/runs/${TASK_NAME}/${TASK_TYPE}/${MODEL_NAME}/${MODEL_KIND}/lr${LR}_${SCHEDULER}_adamw_wd1e-03_k${KEY_SIZE}-v${VALUE_SIZE}-p${NUM_PAIRS}-${MAX_N_SEGMENTS}x${INPUT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_${SEGMENT_ORDERING}_bptt-${K2}_${NUM_LAYERS}l${NUM_LAYERS}hd${DIM}/run_$N"
+MODEL_PATH="/data/home/admin/rmt/runs/${TASK_NAME}/${TASK_TYPE}/${MODEL_NAME}/${MODEL_KIND}/eval/lr${LR}_${SCHEDULER}_adamw_wd1e-03_k${KEY_SIZE}-v${VALUE_SIZE}-p${NUM_PAIRS}-${MAX_N_SEGMENTS}x${INPUT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_${SEGMENT_ORDERING}_bptt-${K2}_${NUM_LAYERS}l${NUM_LAYERS}hd${DIM}_from_k${PREV_KEY_SIZE}-v${PREV_VALUE_SIZE}-p${PREV_NUM_PAIRS}/run_$N"
+MODEL_CPT=runs/${TASK_NAME}/${TASK_TYPE}/${MODEL_NAME}/${MODEL_KIND}/lr${LR}_${SCHEDULER}_adamw_wd1e-03_k${PREV_KEY_SIZE}-v${PREV_VALUE_SIZE}-p${PREV_NUM_PAIRS}-${PREV_MAX_N_SEGMENTS}x${INPUT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_${SEGMENT_ORDERING}_bptt-${PREV_MAX_N_SEGMENTS}_${NUM_LAYERS}l${NUM_LAYERS}hd${DIM}/run_$N 
 
 if [ $OVERWRITE_RUNS -eq 1 -o ! -d $MODEL_PATH ]; then
 
@@ -131,7 +133,7 @@ echo gradient accumulation steps $GRAD_ACC_STEPS
 
 echo RUNNING: TASK_NAME TASK_TYPE MEMORY_SIZE KEY_SIZE VALUE_SIZE N_SEG  MODEL_NAME MODEL_CLS LR N
 echo RUNNING: $TASK_NAME $TASK_TYPE $MEMORY_SIZE $KEY_SIZE $VALUE_SIZE $MAX_N_SEGMENTS $MODEL_NAME $MODEL_CLS $LR $N
-accelerate launch --config_file $ACCEL_CONFIG --main_process_port 29221 run_finetuning_associative_retrieval.py \
+accelerate launch --config_file $ACCEL_CONFIG --main_process_port 29225 run_finetuning_associative_retrieval.py \
         --task_name $TASK_NAME \
         --model_path $MODEL_PATH \
         --model_cfg $MODEL_CFG \
@@ -160,18 +162,18 @@ accelerate launch --config_file $ACCEL_CONFIG --main_process_port 29221 run_fine
         --clip_grad_norm 1.0 \
         --dataset_path /data/home/admin/rmt/datasets/associative_retrieval \
         --layers_attr gpt_neox.layers \
-        --train_size 100000 \
-        --valid_size 1000 \
-        --test_size 10000 \
+        --valid_size 20000 --train_size 1 --test_size 1 \
+        --validate_only \
         --aggr_type full \
+        --d_mem 32 \
         --vary_n_segments \
         --res_mem_count $RES_MEM_COUNT $REWRITE_FLAG \
         --reset_optimizer --reset_lr \
+        --model_cpt $MODEL_CPT \
         --use_generate_on_valid --save_best
         
         # --layers_attr transformer.h \
         # --early_stopping_patience 10 
-        # --model_cpt $MODEL_CPT
         # --use_generate_on_valid \
 
 else

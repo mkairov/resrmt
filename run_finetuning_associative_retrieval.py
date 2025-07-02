@@ -94,7 +94,7 @@ parser.add_argument('--train_size', type=int, default=10000, help='number of sam
 parser.add_argument('--valid_size', type=int, default=1000, help='number of samples in validation split')
 parser.add_argument('--test_size', type=int, default=2000, help='number of samples in test split')
 parser.add_argument('--segment_size', type=int, default=128, help='number of useful tokens in a segment')
-parser.add_argument('--d_mem', type=int, default=None, help='number of rows in associative matrix')
+parser.add_argument('--d_mem', type=int, default=32, help='number of rows in associative matrix')
 parser.add_argument('--rewrite_setting', action='store_true', default=False,
                     help='keys can occur several times')
 parser.add_argument('--no_correction', action='store_true', default=False,
@@ -330,7 +330,7 @@ if __name__ == '__main__':
         dataset_name += '_for_training'
     path = os.path.join(args.dataset_path, dataset_name)
     with accelerator.main_process_first():
-        if os.path.exists(path):
+        if False and os.path.exists(path):
             print(f"Loading {dataset_name} from disk.")
             train_dataset = torch.load(os.path.join(path, 'train'), weights_only=False)
             valid_dataset = torch.load(os.path.join(path, 'valid'), weights_only=False)
@@ -341,9 +341,9 @@ if __name__ == '__main__':
             valid_dataset = ARDataset(args.key_size, args.value_size, sample_len=args.num_test_pairs, num_samples=args.valid_size)
             test_dataset = ARDataset(args.key_size, args.value_size, sample_len=args.num_test_pairs, num_samples=args.test_size)
 
-            torch.save(train_dataset, os.path.join(path, 'train'))
-            torch.save(valid_dataset, os.path.join(path, 'valid'))
-            torch.save(test_dataset,  os.path.join(path, 'test'))
+            # torch.save(train_dataset, os.path.join(path, 'train'))
+            # torch.save(valid_dataset, os.path.join(path, 'valid'))
+            # torch.save(test_dataset,  os.path.join(path, 'test'))
 
     train_rnd_generator = torch.Generator()
     train_rnd_generator.manual_seed(args.seed)
@@ -424,7 +424,7 @@ if __name__ == '__main__':
         if args.model_cpt and args.model_cpt != 'None':
             model_cpt = os.path.join(args.model_cpt, "model_best/model.pth")
             cpt = torch.load(model_cpt, map_location='cpu')
-            model.load_state_dict(cpt)
+            model.load_state_dict(cpt, strict=False)
             logger.info(f'Loaded RMT state dict from: {args.model_cpt}')
 
     if args.freeze_model_weights:

@@ -9,7 +9,8 @@ from modeling_rmt.rmt_br import MemoryAttention, GPTMemoryAttention, GPTMemoryFu
 
 
 class MemoryCell(torch.nn.Module):
-    def __init__(self, base_model, num_mem_tokens, res_mem_count=0, layers_attr='transformers.h', aggr_type='mem_attn', aggr_pos_embed='rope', **kwargs):
+    def __init__(self, base_model, num_mem_tokens: int, res_mem_count: int = 0,
+                 layers_attr: str = 'transformers.h', aggr_type: str = 'mem_attn', aggr_pos_embed: str = 'rope', **kwargs):
         super().__init__()
         self.model = base_model
         self.num_mem_tokens = num_mem_tokens
