@@ -306,7 +306,8 @@ class Trainer:
         with torch.set_grad_enabled(is_train_mode):
             for j in range(0, batch_size, self.args.batch_size):
                 is_last_batch = (j == (batch_size // self.args.batch_size - 1) * self.args.batch_size)
-                grad_sync_context = contextlib.nullcontext if is_last_batch else self.accelerator.no_sync
+                # grad_sync_context = contextlib.nullcontext if is_last_batch else self.accelerator.no_sync
+                grad_sync_context = contextlib.nullcontext
                 with grad_sync_context(self.model):
                     subbatch = {k: batch[k][j: j + self.args.batch_size] for k in batch}
                     # filter items from batch that are not used by model forward
