@@ -43,15 +43,15 @@ class MemoryLayerWrapper(nn.Module):
         self.first_segment = True
         self.seg_num = 0
 
-        self.prev_layer = None
+        # self.prev_layer = None
 
     def create_memory(self, memory_dim, num_mem_tokens, embd_std):
         memory_weights = torch.randn((num_mem_tokens, memory_dim)) * embd_std
         # memory_weights = torch.zeros((num_mem_tokens, memory_dim))
         self.register_parameter('memory', torch.nn.Parameter(memory_weights, requires_grad=True))
 
-        self.read_memory_position = range(num_mem_tokens)
-        self.write_memory_position = range(-num_mem_tokens, 0)
+        # self.read_memory_position = range(num_mem_tokens)
+        # self.write_memory_position = range(-num_mem_tokens, 0)
 
     def set_memory(self, input_shape):
         memory = self.memory.repeat(input_shape[0], 1, 1)
@@ -68,19 +68,17 @@ class MemoryLayerWrapper(nn.Module):
         if self.num_mem_tokens > 0:
             if self.memory_state is None:
                 self.memory_state = self.set_memory(hidden_states.shape)
-            if self.prev_layer is None:
-                prev_layer_memory = self.set_memory(hidden_states.shape)
-            else:
-                prev_layer_memory = self.prev_layer.memory_state
+            # if self.prev_layer is None:
+            #     prev_layer_memory = self.set_memory(hidden_states.shape)
+            # else:
+            #     prev_layer_memory = self.prev_layer.memory_state
 
             # logger.info(hidden_states.device)
             # logger.info(self.memory_state.device)
 
-            if not self.generate_mode:
-                hidden_states = hidden_states[:, self.num_mem_tokens:-self.num_mem_tokens, :]
-                hidden_states = torch.cat([self.memory_state, hidden_states, prev_layer_memory], dim=1)
-            elif self.first_segment:
-                self.first_segment = False
+            if not self.generate_mode or self.first_segment:
+                if self.generate_mode:
+                    self.first_segment = False
                 hidden_states = hidden_states[:, self.num_mem_tokens:]
                 hidden_states = torch.cat([self.memory_state, hidden_states], dim=1)
         
@@ -88,7 +86,7 @@ class MemoryLayerWrapper(nn.Module):
         # logger.info(attention_mask.device)
         
         out = self.layer(hidden_states=hidden_states, attention_mask=attention_mask, **kwargs)
-        if self.num_mem_tokens > 0:
+        if self.num_mem_tokens > 0 and not self.generate_mode:
             self.memory_state = out[0][:, -self.num_mem_tokens:]
         return out
 
@@ -106,6 +104,12 @@ class MemoryCell(nn.Module):
         self.model = base_model
         self.num_mem_tokens = num_mem_tokens
 
+        memory_dim = self.model.config.hidden_size
+        embd_std = self.model.get_input_embeddings().weight.data.std().cpu().item()
+        if self.num_mem_tokens > 0:
+            self.create_memory(memory_dim, num_mem_tokens, embd_std)
+        self.memory_state = None
+
         self.layers = self.model
         self.layers_attrs = layers_attr.split('.')
         for i, attr in enumerate(self.layers_attrs):
@@ -120,31 +124,44 @@ class MemoryCell(nn.Module):
             self.layers[i] = MemoryLayerWrapper(
                 layer=self.layers[i],
                 num_mem_tokens=num_mem_tokens,
-                memory_dim=self.model.config.hidden_size,
+                memory_dim=memory_dim,
                 res_mem_count=res_mem_count,
-                embd_std=self.model.get_input_embeddings().weight.data.std().cpu().item(),
+                embd_std=embd_std,
                 aggr_type=aggr_type,
                 aggr_pos_embed=aggr_pos_embed,
                 **kwargs
             )
         
-        for i in range(1, len(self.layers)):
-            self.layers[i].prev_layer = self.layers[i - 1]
+        # for i in range(1, len(self.layers)):
+        #     self.layers[i].prev_layer = self.layers[i - 1]
+
+    def create_memory(self, memory_dim, num_mem_tokens, embd_std):
+        memory_weights = torch.randn((num_mem_tokens, memory_dim)) * embd_std
+        # memory_weights = torch.zeros((num_mem_tokens, memory_dim))
+        self.register_parameter('memory', torch.nn.Parameter(memory_weights, requires_grad=True))
+
+        # self.read_memory_position = range(num_mem_tokens)
+        # self.write_memory_position = range(-num_mem_tokens, 0)
+
+    def set_memory(self, input_shape):
+        memory = self.memory.repeat(input_shape[0], 1, 1)
+        return memory
 
     def forward(self, input_ids, **kwargs):
-        for i in range(1, len(self.layers)):
-            self.layers[i].prev_layer = self.layers[i - 1]
+        # for i in range(1, len(self.layers)):
+        #     self.layers[i].prev_layer = self.layers[i - 1]
 
         seg_kwargs = self.process_input(input_ids, write_mem=True, **kwargs)
         out = self.model(**seg_kwargs)
         out = self.process_output(out, **kwargs)
 
-        for i in range(1, len(self.layers)):
-            self.layers[i].prev_layer = None
+        # for i in range(1, len(self.layers)):
+        #     self.layers[i].prev_layer = None
 
         return out
     
     def reset_memory(self):
+        self.memory_state = None
         for layer in self.layers:
             layer.reset_memory()
     
@@ -163,17 +180,19 @@ class MemoryCell(nn.Module):
     def process_input(self, input_ids, write_mem=True, **kwargs):
         seg_kwargs = dict(**kwargs)
 
+        if self.memory_state is None:
+            self.memory_state = self.set_memory(input_ids.shape)
+
         inputs_embeds = kwargs.get('inputs_embeds', None)
         device = next(self.parameters()).device
         if inputs_embeds is None:
             inputs_embeds = self.model.get_input_embeddings()(input_ids.to(device))
         
         if self.num_mem_tokens > 0:
-            blank_tokens = torch.zeros((inputs_embeds.shape[0], self.num_mem_tokens, inputs_embeds.shape[2]), dtype=inputs_embeds.dtype, device=inputs_embeds.device)
             if write_mem:
-                inputs_embeds = torch.cat([blank_tokens, inputs_embeds, blank_tokens], dim=1)
+                inputs_embeds = torch.cat([self.memory_state, inputs_embeds, self.memory_state], dim=1)
             else:
-                inputs_embeds = torch.cat([blank_tokens, inputs_embeds], dim=1)
+                inputs_embeds = torch.cat([self.memory_state, inputs_embeds], dim=1)
 
         seg_kwargs['input_ids'] = None
         seg_kwargs['inputs_embeds'] = inputs_embeds

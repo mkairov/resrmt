@@ -1,26 +1,17 @@
-import json
 import logging
 import os
-import math
-import shutil
 from pathlib import Path
-from itertools import chain
 
-# from dotenv import load_dotenv
 import torch
 import numpy as np
-import datasets
 import transformers
 from torch.utils.data import DataLoader
-from huggingface_hub import hf_hub_download
 
-from lm_experiments_tools import  Trainer,  TrainerArgs
-
-from torch.nn.utils.rnn import pad_sequence
+from lm_experiments_tools.data import ar_collate_fn, ARDataset
+from lm_experiments_tools import Trainer, TrainerArgs
+from functools import partial
 
 import accelerate
-
-# load_dotenv()
 
 logger_fmt = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 logging.basicConfig(format=logger_fmt, level=logging.INFO)
@@ -36,7 +27,7 @@ logger.info(f"CUDA_VISIBLE_DEVICES: {os.environ['CUDA_VISIBLE_DEVICES']}")
 logger.info(f"CUDA DEVICE COUNT: {torch.cuda.device_count()}")
 
 # import transformers  # noqa: E402
-from transformers import AutoConfig, AutoTokenizer, HfArgumentParser  # noqa: E402
+from transformers import AutoConfig, HfArgumentParser  # noqa: E402
 
 from lm_experiments_tools.utils import get_cls_by_name, get_optimizer, prepare_run  # noqa: E402
 import lm_experiments_tools.optimizers as optimizers  # noqa: E402
@@ -131,79 +122,6 @@ parser.add_argument('--warmup_init', action='store_true', default=False,
 
 
 NUM_SYMBOLS = 16
-from tqdm.auto import tqdm
-
-def generate_pairs(key_size, value_size, num_pairs, num_samples):
-    keys = torch.empty((num_samples, num_pairs, key_size))
-
-    if not rewrite_setting:
-        for i in tqdm(range(num_samples)):
-            key = torch.randperm(NUM_SYMBOLS ** key_size)[:num_pairs]
-            for j in range(key_size):
-                keys[i, :, j] = key % NUM_SYMBOLS
-                key //= NUM_SYMBOLS
-    else:
-        keys = torch.randint(0, NUM_SYMBOLS, (num_samples, num_pairs, key_size))
-    
-    values = torch.randint(0, NUM_SYMBOLS, (num_samples, num_pairs, value_size))
-
-    # if vary_n_pairs:
-    #     keys_list = []
-    #     values_list = []
-    #     for key in keys:
-    #         n = torch.randint(1, len(key)+1)
-    #         keys_list.append(key[-n:])
-    #         values_list.append(values[-n:])
-    #     keys = keys_list
-    #     values = values_list
-    
-    # keys = torch.randint(0, NUM_SYMBOLS, (num_pairs * 2, key_size))
-    # keys[:, 0] = torch.randint(1, NUM_SYMBOLS, (num_pairs * 2, ))
-    
-    # unique = keys.unique(dim=0)
-    # delta_pairs = num_pairs - unique.shape[0]
-    # if delta_pairs > 0:
-    #     print('got unique')
-    #     return generate_pairs(key_size, value_size, num_pairs)
-
-    # selected_ids = torch.randperm(unique.shape[0])[:num_pairs]
-    # keys = unique[selected_ids]
-
-    # values[:, 0] = torch.randint(1, NUM_SYMBOLS, (num_pairs, ))
-    return keys, values
-
-
-class ARDataset:
-    def __init__(self, key_size, value_size, sample_len=1, num_samples=20_000):
-        self.sample_len = sample_len
-        self.keys, self.values = generate_pairs(key_size, value_size, sample_len, num_samples)
-        # self.keys = keys.reshape(num_samples, -1)
-        # self.values = values.reshape(num_samples, -1)
-        if not rewrite_setting:
-            self.target_key_inds = torch.randint(sample_len, (num_samples, ))
-        else:
-            self.target_key_inds = torch.empty((num_samples,), dtype=torch.long)
-            for i in tqdm(range(num_samples)):
-                unique_keys = self.keys[i].unique(dim=0)
-                key = unique_keys[torch.randperm(len(unique_keys))[0]]
-                try:
-                    idx = torch.max(torch.where(torch.all(self.keys[i] == key, dim=-1))[0], dim=0)[0].long()
-                except Exception:
-                    print(f"{self.keys[i]}, {key}")
-                    raise 1
-                assert torch.all(self.keys[i][idx] == key)
-                self.target_key_inds[i] = idx
-    def __getitem__(self, idx):
-        keys, values, tgt_ind = self.keys[idx], self.values[idx], self.target_key_inds[idx]
-        # dim = 0 if keys.ndim == 1 else 1
-        # keys = torch.chunk(keys, self.sample_len, dim=dim)
-        # values = torch.chunk(values, self.sample_len, dim=dim)
-        sample = {'keys': keys, 'values': values, 'target_key_ind': tgt_ind}
-        return sample
-    def __len__(self):
-        return self.keys.shape[0]
-    
-
 if __name__ == '__main__':
     args = parser.parse_args()
     if args.num_test_pairs is None:
@@ -223,96 +141,13 @@ if __name__ == '__main__':
         logger.warning('model_path is not set: config, logs and checkpoints will not be saved.')
 
     rewrite_setting = args.rewrite_setting
-    # # create model path and save configuration
-    # # todo: use prepare run
-    # if accelerator.is_main_process and args.model_path is not None:
-    #     model_path = Path(args.model_path)
-    #     if not model_path.exists():
-    #         Path(model_path).mkdir(parents=True)
-    #     args_dict = collect_run_configuration(args)
-    #     # todo: if model path exists and there is config file, write new config file aside
-    #     json.dump(args_dict, open(model_path/'config.json', 'w'), indent=4)
-    #     open(model_path / 'git.diff', 'w').write(get_git_diff())
-
     prepare_run(args, logger, logger_fmt)
 
-    # if not args.from_pretrained:
-    #     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-    # else:
-    #     tokenizer = AutoTokenizer.from_pretrained(args.from_pretrained)
+    block_size = args.segment_size
+    sep_token, gen_token, eos_token = 100, 101, 102
 
-    import os
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    if args.model_type == 'decoder':
-        block_size = args.segment_size
-        sep_token, gen_token, eos_token = 100, 101, 102
-
-        def collate_fn(batch, valid=False):
-            keys = [b['keys'] for b in batch]
-            values = [b['values'] for b in batch]
-            
-            if not args.vary_n_segments:
-                tgt_inds = [b['target_key_ind'].item() for b in batch]
-                n = len(keys[0])
-            else:
-                n = torch.randint(1, len(keys[0])+1, size=())
-                keys = [x[-n:] for x in keys]
-                values = [x[-n:] for x in values]
-                if not rewrite_setting:
-                    tgt_inds = [torch.randint(0, n, size=()).item() for _ in range(len(keys))]
-                else:
-                    tgt_inds = []
-                    for i in range(len(keys)):
-                        unique_keys = keys[i].unique(dim=0)
-                        key = unique_keys[torch.randperm(len(unique_keys))[0]]
-                        try:
-                            idx = torch.max(torch.where(torch.all(keys[i] == key, dim=-1))[0], dim=0)[0].long()
-                        except Exception:
-                            print(f"{keys[i]}, {key}")
-                            raise 1
-                        assert torch.all(keys[i][idx] == key)
-                        tgt_inds.append(idx)
-
-
-
-            bs = len(keys)
-            sep_tokens = torch.ones(bs, 1) * sep_token
-            eos_tokens = torch.ones(bs, 1) * eos_token
-            gen_tokens = torch.ones(bs, 1) * gen_token
-            sample = []
-
-            for i in range(n):
-                sample.append(torch.stack([k[i] for k in keys]))
-                sample.append(sep_tokens)
-                sample.append(torch.stack([v[i] for v in values]))
-                sample.append(eos_tokens)
-
-            target_keys = torch.stack([k[i] for i, k in zip(tgt_inds, keys)])
-            target_values = torch.stack([k[i] for i, k in zip(tgt_inds, values)])
-
-            sample.append(target_keys)
-            sample.append(gen_tokens)
-
-            input_ids_generate = torch.cat(sample, dim=1)
-
-            sample.append(target_values)
-            sample.append(eos_tokens)
-            input_ids = torch.cat(sample, dim=1)
-
-            labels_mask = torch.zeros_like(input_ids).bool()
-            labels_mask[:, -args.value_size - 2:] = True
-
-            collated = {'input_ids': input_ids.long(), 
-                        'input_ids_generate': input_ids_generate.long(), 
-                        'attention_mask': torch.ones_like(input_ids).bool(),
-                        'attention_mask_generate': torch.ones_like(input_ids_generate).bool(),
-                        'labels': input_ids.long(), 
-                        'labels_mask': labels_mask, 
-                        }
-            return collated
-            
-    else:
-        raise NotImplementedError(f'Unknown model type {args.model_type}')
+    collate_fn = partial(ar_collate_fn, vary_n_segments=args.vary_n_segments, rewrite_setting=args.rewrite_setting,
+                            sep_token=sep_token, gen_token=gen_token, eos_token=eos_token, value_size=args.value_size)
 
     kwargs = {'pin_memory': True, 'num_workers': args.data_n_workers}
     # get train dataset
@@ -330,20 +165,19 @@ if __name__ == '__main__':
         dataset_name += '_for_training'
     path = os.path.join(args.dataset_path, dataset_name)
     with accelerator.main_process_first():
-        if False and os.path.exists(path):
+        if os.path.exists(path):
             print(f"Loading {dataset_name} from disk.")
             train_dataset = torch.load(os.path.join(path, 'train'), weights_only=False)
             valid_dataset = torch.load(os.path.join(path, 'valid'), weights_only=False)
             test_dataset = torch.load(os.path.join(path, 'test'), weights_only=False)
         else:
             os.system(f"mkdir {path}")
-            train_dataset = ARDataset(args.key_size, args.value_size, sample_len=args.num_pairs, num_samples=args.train_size)
-            valid_dataset = ARDataset(args.key_size, args.value_size, sample_len=args.num_test_pairs, num_samples=args.valid_size)
-            test_dataset = ARDataset(args.key_size, args.value_size, sample_len=args.num_test_pairs, num_samples=args.test_size)
-
-            # torch.save(train_dataset, os.path.join(path, 'train'))
-            # torch.save(valid_dataset, os.path.join(path, 'valid'))
-            # torch.save(test_dataset,  os.path.join(path, 'test'))
+            train_dataset = ARDataset(args.key_size, args.value_size, sample_len=args.num_pairs, num_samples=args.train_size, rewrite_setting=args.rewrite_setting, num_symbols=NUM_SYMBOLS)
+            valid_dataset = ARDataset(args.key_size, args.value_size, sample_len=args.num_test_pairs, num_samples=args.valid_size, rewrite_setting=args.rewrite_setting, num_symbols=NUM_SYMBOLS)
+            test_dataset = ARDataset(args.key_size, args.value_size, sample_len=args.num_test_pairs, num_samples=args.test_size, rewrite_setting=args.rewrite_setting, num_symbols=NUM_SYMBOLS)
+            torch.save(train_dataset, os.path.join(path, 'train'))
+            torch.save(valid_dataset, os.path.join(path, 'valid'))
+            torch.save(test_dataset,  os.path.join(path, 'test'))
 
     train_rnd_generator = torch.Generator()
     train_rnd_generator.manual_seed(args.seed)
@@ -381,66 +215,57 @@ if __name__ == '__main__':
         model.load_state_dict(cpt['model_state_dict'])
         logger.info(f'Loaded baseline state dict from: {args.backbone_cpt}')
 
-    # Pass memory settings to pretrained model
-    if True:
         
-        memory_cell_cls = get_cls_by_name(args.memory_cell_cls)
-        recurrent_wrapper_cls = get_cls_by_name(args.recurrent_wrapper_cls)
-        logger.info(f'Wrapping in: {memory_cell_cls} and {recurrent_wrapper_cls}')
-        
-        
-        mem_cell_args = dict(
-            base_model=model,
-        )
-        if args.d_mem is not None:
-            mem_cell_args['d_mem'] = args.d_mem
+    memory_cell_cls = get_cls_by_name(args.memory_cell_cls)
+    recurrent_wrapper_cls = get_cls_by_name(args.recurrent_wrapper_cls)
+    logger.info(f'Wrapping in: {memory_cell_cls} and {recurrent_wrapper_cls}')
+    
+    
+    mem_cell_args = dict(
+        base_model=model,
+    )
+    if args.d_mem is not None:
+        mem_cell_args['d_mem'] = args.d_mem
 
-        if args.num_mem_tokens is not None:
-            mem_cell_args['num_mem_tokens'] = args.num_mem_tokens
-            # mem_cell_args['wrap_pos'] = args.wrap_pos
-        if args.layers_attr is not None:
-            mem_cell_args['layers_attr'] = args.layers_attr
-            mem_cell_args["aggr_type"] = args.aggr_type
-        if args.aggr_pos_embed is not None:
-            mem_cell_args["aggr_pos_embed"] = args.aggr_pos_embed
-        if args.res_mem_count is not None:
-            mem_cell_args["res_mem_count"] = args.res_mem_count
+    if args.num_mem_tokens is not None:
+        mem_cell_args['num_mem_tokens'] = args.num_mem_tokens
+        # mem_cell_args['wrap_pos'] = args.wrap_pos
+    if args.layers_attr is not None:
+        mem_cell_args['layers_attr'] = args.layers_attr
+        mem_cell_args["aggr_type"] = args.aggr_type
+    if args.aggr_pos_embed is not None:
+        mem_cell_args["aggr_pos_embed"] = args.aggr_pos_embed
+    if args.res_mem_count is not None:
+        mem_cell_args["res_mem_count"] = args.res_mem_count
 
-        if args.no_correction:
-            mem_cell_args['correction'] = False
+    if args.no_correction:
+        mem_cell_args['correction'] = False
 
-        cell = memory_cell_cls(**mem_cell_args)
-        model = recurrent_wrapper_cls(
-            cell, 
-            segment_size=block_size,
-            max_n_segments=args.max_n_segments, 
-            k2=args.k2,
-            segment_alignment=args.segment_alignment,
-            res_mem_count=args.res_mem_count
-        )
+    cell = memory_cell_cls(**mem_cell_args)
+    model = recurrent_wrapper_cls(
+        cell, 
+        segment_size=block_size,
+        max_n_segments=args.max_n_segments, 
+        k2=args.k2,
+        segment_alignment=args.segment_alignment,
+        res_mem_count=args.res_mem_count
+    )
                                     
 
         ## load cpt of rmt
-        if args.model_cpt and args.model_cpt != 'None':
-            model_cpt = os.path.join(args.model_cpt, "model_best/model.pth")
-            cpt = torch.load(model_cpt, map_location='cpu')
-            model.load_state_dict(cpt, strict=False)
-            logger.info(f'Loaded RMT state dict from: {args.model_cpt}')
+    if args.model_cpt and args.model_cpt != 'None':
+        model_cpt = os.path.join(args.model_cpt, "model_best/model.pth")
+        cpt = torch.load(model_cpt, map_location='cpu')
+        model.load_state_dict(cpt, strict=False)
+        logger.info(f'Loaded RMT state dict from: {args.model_cpt}')
 
     if args.freeze_model_weights:
         for n, p in model.named_parameters():
-            # if 'memory' not in n and 'wte' not in n:
             if 'memory' not in n and 'lora' not in n and 'aggr' not in n:
                 p.requires_grad = False
         logger.info(f'Frozen moodel weights')
         logger.info(f'Remaining parameters: {[n for n, p in model.named_parameters() if p.requires_grad]}')
 
-    # # fix the not-contiguous error with loralib and horovod
-    # def make_contiguous(module):
-    #     with torch.no_grad():
-    #         for param in module.parameters():
-    #             param.set_(param.contiguous())
-    # make_contiguous(model)
     
     # define optimizer
     optimizer_cls = get_optimizer(args.optimizer)
@@ -464,22 +289,19 @@ if __name__ == '__main__':
     def keep_for_metrics_fn(batch, output):
         # select data from batch and model output that would be used to compute metrics
         data = {}
-        if 'generation_outputs' in output:
-            data['labels'] = batch['labels']
-            data['labels_mask'] = batch['labels_mask']
+        data['labels'] = batch['labels']
+        data['labels_mask'] = batch['labels_mask']
 
+        if 'generation_outputs' in output:
             data['generation_outputs'] = output['generation_outputs']
-            # if 'labels_mask' in batch:
-            #     data['generation_outputs'] = [data['generation_outputs'][i, mask] for i, mask in enumerate(batch['labels_mask'])]
-        # if args.model_type == 'encoder':
-            
-            ##### booydar
-            # data['predictions'] = torch.argmax(output['logits'].detach(), dim=-1)
-        # data['labels'] = batch['labels']
+        
+        if 'logits' in output:
+            data['predictions'] = torch.argmax(output['logits'].detach(), dim=-1)
+            data['predicted_labels'] = [p[m] for p, m in zip(data['predictions'], batch['labels_mask'])]
+
         for key in batch.keys():
             if 'loss' in key: 
                 data[key] = batch[key]
-        # else:
 
         return data
 
@@ -500,50 +322,42 @@ if __name__ == '__main__':
         metrics = {}
         y, p = None, None
         if 'generation_outputs' in data:
-            y = data['labels']
-            p = data['generation_outputs']
+            y, p = data['labels'], data['generation_outputs']
 
             metrics['exact_match'] = np.mean([(len(p_) >= args.value_size + 1) and torch.all(torch.tensor(y_)[-args.value_size - 1:] == torch.tensor(p_[-args.value_size - 1:])) \
                                               for p_, y_ in zip (p, y)])
 
-            # replace -100 with pad token in labels
-            # y = torch.stack([l[m] for l, m in zip(data['labels'], data['labels_mask'])])
-            # y = data['labels'][:, -args.value_size - 1:-1]
-            # p = data['generation_outputs']
-            # if not hasattr(p, 'shape'):
-            #     p = torch.stack([torch.tensor(x) for x in p])
-            # # p = p[:, -args.value_size - 1:-1]
-
-            # metrics['exact_match'] = np.mean([(len(y_) == len(p_)) and (y_ == p_) for p_, y_ in zip (p, y)])
-            # metrics['exact_match'] = np.mean([y_ == p_ for p_, y_ in zip (p, y)])
-            # preds = tokenizer.batch_decode(data['generation_outputs'], skip_special_tokens=False)
-            # p = [p[:p.index(tokenizer.eos_token)] if tokenizer.eos_token in p else p for p in preds]
             if args.show_valid_examples > 0:
                 for i in range(min(args.show_valid_examples, len(y))):
                     logger.info(f"labels: {data['labels'][i]}")
                     logger.info(f"gen: {data['generation_outputs'][i]}")
                     logger.info(f'y: {y[i][-args.value_size - 1:]}')
                     logger.info(f'p: {p[i][-args.value_size - 1:]}')
-                    # logger.info(f'p ids: {data["generation_outputs"][i]}')
-                    # logger.info('\n'.join([(y_, p_[:len(y_)], y_==p_[:len(y_)]) for p_, y_ in zip (p, y[:30])]))
+                    logger.info(f'full gen p: {p[i]}')
 
                     logger.info('-' * 50)
-            # todo: do we need to better clean P to remove tokens after eos? not remove special tokens only
-        # elif args.model_type == 'encoder':
-        #     y, p = data['labels'], data['predictions']
+        
+        elif 'predictions' in data:
+            y, p = [torch.Tensor(i) for i in data['labels']], [torch.Tensor(i) for i in data['predictions']]
+            # y, p = data['labels'], data['predictions']
+            masks = data['labels_mask']
 
-        # if y is not None and p is not None:
-            # if args.model_type == 'encoder-decoder':
-            # if not isinstance(y[0], list):
-                # y = [[_y] for _y in y]
-            # result = scrolls_metric.compute(predictions=p, references=y)
-            # for metric_name in task_to_metric[args.task_name]:
-            #     metrics[metric_name] = result[metric_name]
+            for i in range(len(y)):
+                # logger.info(y[i])
+                # if not isinstance(y, torch.Tensor):
+                #     y[i] = torch.tensor(y[i])
+                y[i] = y[i][masks[i]]
+                p[i] = p[i][:-1][masks[i][1:]]
 
-            # metrics['exact_match'] = np.mean([y_ == p_[:len(y_)] for p_, y_ in zip (p, y)])
-            # elif args.model_type == 'encoder' and args.task_name == 'contract_nli':
-            #     metrics['exact_match'] = accuracy_score(y, p) * 100
-            #     metrics['f1_micro'] = f1_score(y, p, average='micro')
+            metrics['exact_match'] = np.mean([(len(p_) >= args.value_size + 1) and torch.all(torch.tensor(y_)[-args.value_size - 1:] == torch.tensor(p_[-args.value_size - 1:])) \
+                                              for p_, y_ in zip(p, y)])
+            if args.show_valid_examples > 0:
+                for i in range(min(args.show_valid_examples, len(y))):
+                    logger.info(f'y: {y[i]}')
+                    logger.info(f'p: {p[i]}')
+
+                    logger.info('-' * 50)
+
         return metrics
 
     # accelerate
