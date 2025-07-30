@@ -2,10 +2,10 @@
 set -e
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=1
 export CUBLAS_WORKSPACE_CONFIG=:4096:2
 export CUDA_LAUNCH_BLOCKING=1
-NP=2
+NP=1
 
 MODEL_TYPE=decoder
 BACKBONE_CLS=transformers:AutoModelForCausalLM
@@ -34,6 +34,9 @@ elif [ $MODEL_KIND = "rmt-ms" ]; then
 elif [ $MODEL_KIND = "armt" ]; then
     MEMORY_CELL=modeling_rmt.armt:AssociativeMemoryCell
     RECURRENT_WRAPPER=modeling_rmt.armt:AssociativeRecurrentWrapper
+elif [ $MODEL_KIND = "rmt4" ]; then
+    MEMORY_CELL=modeling_rmt.rmt4:MemoryCell
+    RECURRENT_WRAPPER=modeling_rmt.rmt4:RecurrentWrapper
 else
     echo Model $MODEL_KIND not found, aborting
     exit 1
@@ -43,19 +46,19 @@ MODEL_NAME=gpt2  # backbone model
     
 ITERS=10000
 
-for TASK_DATASET in qa1_single-supporting-fact; do
+# for TASK_DATASET in qa1_single-supporting-fact; do
 # for TASK_DATASET in qa2_two-supporting-facts; do
-# for TASK_DATASET in qa3_three-supporting-facts; do
+for TASK_DATASET in qa3_three-supporting-facts; do
 # for TASK_DATASET in qa4_two-arg-relations; do
 
-# for TASK_DATASET in qa1_single-supporting-fact qa3_three-supporting-facts qa4_two-arg-relations; do
+# for TASK_DATASET in qa1_single-supporting-fact qa3_three-supporting-facts; do
 
-for LR in 1e-04; do
+for LR in 1e-05; do
 
 TBS=64
 for SEGMENT_SIZE in 128; do
-MAX_N_SEGMENTSS=(0 0 4)
-BSS=(0 0 4)
+MAX_N_SEGMENTSS=(0 0 1 2 4)
+BSS=(0 0 16 8 4)
 
 for (( j=2; j<${#MAX_N_SEGMENTSS[@]}; j++ )); do
 
@@ -82,7 +85,7 @@ WEIGHT_DECAY=1e-02
 
 for RES_MEM_COUNT in 0; do
 
-for N in crepe; do
+for N in qa3_rerun1_cur qa3_rerun2_cur; do
 
 K2=-1 # BPTT unroll length
 
@@ -117,7 +120,7 @@ else
     MODEL_CPT="--model_cpt ${MODEL_CPT}"
 fi
 
-accelerate launch --config_file $ACCEL_CONFIG --main_process_port 29006 run_finetuning_babilong_resrmt.py \
+accelerate launch --config_file $ACCEL_CONFIG --main_process_port 29008 run_finetuning_babilong_resrmt.py \
         --task_dataset $TASK_DATASET \
         --noise_dataset $NOISE_DATASET \
         --babi_path /data/home/admin/rmt/data/tasks_1-20_v1-2/en-10k \

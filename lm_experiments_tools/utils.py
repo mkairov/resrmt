@@ -21,6 +21,12 @@ from transformers.modeling_outputs import ModelOutput
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+import string
+from tokenizers import Tokenizer, Regex
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Split
+from transformers import PreTrainedTokenizerFast
+
 
 def get_cls_by_name(name: str) -> type:
     """Get class by its name and module path.
@@ -263,3 +269,49 @@ class DummyAttentionOutput:
     
     def split(self, *args, **kwargs):
         return self.data
+
+
+def create_noisy_ar_tokenizer():
+    ALPHABET = string.ascii_letters + string.digits
+    # Create character tokenizer
+    chars = ALPHABET + '!?:|'
+    special = {'[PAD]': 0, '[BOS]': 1, '[EOS]': 2, '[UNK]': 3, '|': 4}
+    vocab = {ch: i + len(special) for i, ch in enumerate(chars)}
+    vocab.update(special)
+
+    tokenizer = Tokenizer(WordLevel(vocab, unk_token='[UNK]'))
+    tokenizer.pre_tokenizer = Split(Regex(r'.'), behavior="isolated", invert=True)
+
+    return PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer,
+        pad_token='|',
+        eos_token='|',
+        bos_token='[BOS]',
+        unk_token='[UNK]'
+    )
+
+
+def noisy_ar_collate_fn(batch, tokenizer, max_seg_len=64, num_seg=4, query_len=2, target_len=2):
+    contexts = []
+    gen_inputs = []
+    for item in batch:
+        c = item['context'][:-1]
+        segments = c.split('|')
+        padded_context = [seg.ljust(max_seg_len, '|')[:max_seg_len] for seg in segments]
+        contexts.append(''.join(padded_context) + item['query'] + item['target'])
+        gen_inputs.append(''.join(padded_context) + item['query'])
+    
+    input_ids = tokenizer(contexts, return_tensors="pt", add_special_tokens=False, padding=False).input_ids
+    gen_ids = tokenizer(gen_inputs, return_tensors="pt", add_special_tokens=False, padding=False).input_ids
+    labels_mask = torch.zeros_like(input_ids)
+    target_start_pos = max_seg_len * num_seg + query_len + 3  # account for ?| before query and : after
+    labels_mask[:, target_start_pos:target_start_pos + target_len] = 1  # 
+
+    collated = {}
+    collated['input_ids'] = collated['labels'] = input_ids
+    collated['input_ids_generate'] = gen_ids
+    collated['labels_mask'] = labels_mask.bool()
+    collated['attention_mask'] = (input_ids != tokenizer.convert_tokens_to_ids("|"))
+    collated['attention_mask_generate'] = (gen_ids != tokenizer.convert_tokens_to_ids("|"))
+    collated['target_text'] = [b['target'][:-2] for b in batch]  # account for !|
+    return collated

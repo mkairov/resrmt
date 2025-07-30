@@ -52,16 +52,26 @@ for MEMORY_SIZE in 4; do
 TBS=128
 INPUT_SIZE=2048
 
-NUMS_PAIRSS=(1 2 3 5 10)
-KEY_SIZES=(2 2 2 2 2)
-VALUE_SIZES=(1 1 1 1 1)
-BSS=(128 128 128 128 128)
-ITERSS=(10000 10000 10000 10000 10000)
+# NUMS_PAIRSS=(1 2 3 5 10)
+# KEY_SIZES=(2 2 2 2 2)
+# VALUE_SIZES=(1 1 1 1 1)
+# BSS=(128 128 128 128 128)
+# # ITERSS=(10000 10000 10000 10000 10000)
+# ITERSS=(1000 10000 100 100 100)
+
+
+NUMS_PAIRSS=(10)
+KEY_SIZES=(2)
+VALUE_SIZES=(1)
+BSS=(128)
+# ITERSS=(10000 10000 10000 10000 10000)
+ITERSS=(10000)
 
 DIM=128
 NUM_LAYERS=4
 
-for N in ar_final_cur1 ar_final_cur2 ar_final_cur3; do
+# for N in ar_final_cur1 ar_final_cur2 ar_final_cur3; do
+for N in gooppoop; do
 
 for (( j=0; j<${#NUMS_PAIRSS[@]}; j++ )); do
 
@@ -163,7 +173,7 @@ accelerate launch --config_file $ACCEL_CONFIG --main_process_port 29220 run_fine
         --vary_n_segments \
         --res_mem_count $RES_MEM_COUNT $REWRITE_FLAG \
         --reset_optimizer --reset_lr \
-        --use_generate_on_valid --save_best
+        --save_best
         
         # --layers_attr transformer.h \
         # --early_stopping_patience 10 

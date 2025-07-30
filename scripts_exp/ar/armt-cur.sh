@@ -15,7 +15,7 @@ BACKBONE_CLS=base_models.modeling_gpt_neox:GPTNeoXForCausalLM
 TASK_NAME=associative_retrieval
 METRIC=exact_match
 
-for MODEL_KIND in resrmt; do
+for MODEL_KIND in armt; do
 # for MODEL_KIND in rmt-br rmt-ms; do
 
 if [ $MODEL_KIND = "rmt" ]; then
@@ -101,7 +101,11 @@ fi
 if [[ $j -gt 0 ]]; then
     PREV_NUM_PAIRS=${NUMS_PAIRSS[j-1]}
     PREV_MAX_N_SEGMENTS=$((PREV_NUM_PAIRS + 1))
-    MODEL_CPT=../runs/${TASK_NAME}/${TASK_TYPE}/${MODEL_NAME}/${MODEL_KIND}/lr${LR}_${SCHEDULER}_adamw_wd1e-03_k${KEY_SIZES[j-1]}-v${VALUE_SIZES[j-1]}-p${PREV_NUM_PAIRS}-${PREV_MAX_N_SEGMENTS}x${INPUT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_${SEGMENT_ORDERING}_bptt-${PREV_MAX_N_SEGMENTS}_${NUM_LAYERS}l${NUM_LAYERS}hd${DIM}/run_$N 
+    if [[ $PREV_NUM_PAIRS -ne 0 ]]; then
+        MODEL_CPT=../runs/${TASK_NAME}/${TASK_TYPE}/${MODEL_NAME}/${MODEL_KIND}/lr${LR}_${SCHEDULER}_adamw_wd1e-03_k${KEY_SIZES[j-1]}-v${VALUE_SIZES[j-1]}-p${PREV_NUM_PAIRS}-${PREV_MAX_N_SEGMENTS}x${INPUT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_${SEGMENT_ORDERING}_bptt-${PREV_MAX_N_SEGMENTS}_${NUM_LAYERS}l${NUM_LAYERS}hd${DIM}/run_$N 
+    else
+        MODEL_CPT=None
+    fi
 else
     MODEL_CPT=None
 fi
@@ -121,7 +125,9 @@ cd ..
 
 MODEL_PATH="/data/home/admin/rmt/runs/${TASK_NAME}/${TASK_TYPE}/${MODEL_NAME}/${MODEL_KIND}/lr${LR}_${SCHEDULER}_adamw_wd1e-03_k${KEY_SIZE}-v${VALUE_SIZE}-p${NUM_PAIRS}-${MAX_N_SEGMENTS}x${INPUT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_${SEGMENT_ORDERING}_bptt-${K2}_${NUM_LAYERS}l${NUM_LAYERS}hd${DIM}/run_$N"
 
-if [ $OVERWRITE_RUNS -eq 1 -o ! -d $MODEL_PATH ]; then
+# if [ \( $OVERWRITE_RUNS -eq 1 -o ! -d $MODEL_PATH \) -a $NUM_PAIRS -ne 0 ]; then
+
+if [[ ($OVERWRITE_RUNS -eq 1 || ! -d $MODEL_PATH) && $NUM_PAIRS -ne 0 ]]; then
 
 echo gradient accumulation steps $GRAD_ACC_STEPS
 
@@ -163,7 +169,7 @@ accelerate launch --config_file $ACCEL_CONFIG --main_process_port 29220 run_fine
         --vary_n_segments \
         --res_mem_count $RES_MEM_COUNT $REWRITE_FLAG \
         --reset_optimizer --reset_lr \
-        --use_generate_on_valid --save_best
+        --save_best
         
         # --layers_attr transformer.h \
         # --early_stopping_patience 10 
