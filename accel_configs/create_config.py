@@ -38,7 +38,14 @@ deepspeed_config = {
     "gradient_accumulation_steps": None,
     "gradient_clipping": 1.0,
     "train_batch_size": None,
-    "train_micro_batch_size_per_gpu": None
+    "train_micro_batch_size_per_gpu": None,
+    # "flops_profiler": {
+    #     "enabled": True,
+    #     "profile_step": 1,
+    #     "module_depth": -1,
+    #     "top_modules": 3,
+    #     "detailed": True
+    # },
 }
 
 
@@ -62,7 +69,7 @@ elif args.fp16:
 else:
     precision = ""
 
-accel_config_path = "/data/home/admin/rmt/accel_configs/exp/accelerate/{}_{}tbs{}bs{}g{}c{}np{}.yaml"
+accel_config_path = "/home/mkairov/rmt/accel_configs/exp/accelerate/{}_{}tbs{}bs{}g{}c{}np{}.yaml"
 accel_config_path = accel_config_path.format(
                                             args.prefix,
                                             precision,
@@ -71,7 +78,7 @@ accel_config_path = accel_config_path.format(
                                             args.gradient_accumulation_steps,
                                             args.gradient_clipping, 
                                             args.np)
-deepspeed_config_path = "/data/home/admin/rmt/accel_configs/exp/deepspeed/0s2_" + precision + "tbs{}bs{}g{}c{}.json"
+deepspeed_config_path = "/home/mkairov/rmt/accel_configs/exp/deepspeed/0s2_" + precision + "tbs{}bs{}g{}c{}.json"
 deepspeed_config_path = deepspeed_config_path.format(args.train_batch_size,
                                                      args.train_micro_batch_size_per_gpu,
                                                      args.gradient_accumulation_steps,

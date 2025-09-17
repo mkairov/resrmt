@@ -284,27 +284,33 @@ def create_noisy_ar_tokenizer():
 
     return PreTrainedTokenizerFast(
         tokenizer_object=tokenizer,
-        pad_token='|',
-        eos_token='|',
+        pad_token='[PAD]',
+        eos_token='[EOS]',
         bos_token='[BOS]',
-        unk_token='[UNK]'
+        unk_token='[UNK]',
     )
 
 
-def noisy_ar_collate_fn(batch, tokenizer, max_seg_len=64, num_seg=4, query_len=2, target_len=2):
+def noisy_ar_collate_fn(batch, tokenizer, max_seg_len=32, num_seg=1, query_len=4, target_len=4):
     contexts = []
     gen_inputs = []
+
+    bos_token = '[BOS]'
+
     for item in batch:
         c = item['context'][:-1]
         segments = c.split('|')
+        for i in range(len(segments)):
+            segments[i] = bos_token + segments[i]
+        
         padded_context = [seg.ljust(max_seg_len, '|')[:max_seg_len] for seg in segments]
-        contexts.append(''.join(padded_context) + item['query'] + item['target'])
-        gen_inputs.append(''.join(padded_context) + item['query'])
+        contexts.append(''.join(padded_context) + bos_token + item['query'] + item['target'])
+        gen_inputs.append(''.join(padded_context) + bos_token + item['query'])
     
     input_ids = tokenizer(contexts, return_tensors="pt", add_special_tokens=False, padding=False).input_ids
     gen_ids = tokenizer(gen_inputs, return_tensors="pt", add_special_tokens=False, padding=False).input_ids
     labels_mask = torch.zeros_like(input_ids)
-    target_start_pos = max_seg_len * num_seg + query_len + 3  # account for ?| before query and : after
+    target_start_pos = max_seg_len * num_seg + query_len  # account for [BOS]?! before query and : after
     labels_mask[:, target_start_pos:target_start_pos + target_len] = 1  # 
 
     collated = {}

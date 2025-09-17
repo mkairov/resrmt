@@ -10,7 +10,7 @@ from modeling_rmt.rmt_br import MemoryAttention, GPTMemoryAttention, GPTMemoryFu
 
 class MemoryCell(torch.nn.Module):
     def __init__(self, base_model, num_mem_tokens: int, res_mem_count: int = 0,
-                 layers_attr: str = 'transformers.h', aggr_type: str = 'mem_attn', aggr_pos_embed: str = 'rope', **kwargs):
+                 layers_attr: str = 'transformer.h', aggr_type: str = 'mem_attn', aggr_pos_embed: str = 'rope', **kwargs):
         super().__init__()
         self.model = base_model
         self.num_mem_tokens = num_mem_tokens
@@ -172,7 +172,7 @@ class RecurrentWrapper(torch.nn.Module):
                                    labels_mask=labels_mask,
                                    output_attentions=output_attentions, 
                                    output_hidden_states=output_hidden_states)
-        return out
+        return out['logits']
     
     def generate(self, input_ids, attention_mask=None, **generate_kwargs):
         segmented = self.segment(input_ids=input_ids, attention_mask=attention_mask)

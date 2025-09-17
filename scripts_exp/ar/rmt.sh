@@ -132,7 +132,7 @@ echo gradient accumulation steps $GRAD_ACC_STEPS
 
 echo RUNNING: TASK_NAME TASK_TYPE MEMORY_SIZE KEY_SIZE VALUE_SIZE N_SEG  MODEL_NAME MODEL_CLS LR N
 echo RUNNING: $TASK_NAME $TASK_TYPE $MEMORY_SIZE $KEY_SIZE $VALUE_SIZE $MAX_N_SEGMENTS $MODEL_NAME $MODEL_CLS $LR $N
-accelerate launch --config_file $ACCEL_CONFIG --main_process_port 29223 run_finetuning_associative_retrieval.py \
+accelerate launch --config_file $ACCEL_CONFIG --main_process_port $((28000+$MODEL_KIND+$NUM_PAIRS+$N)) run_finetuning_associative_retrieval.py \
         --task_name $TASK_NAME \
         --model_path $MODEL_PATH \
         --model_cfg $MODEL_CFG \

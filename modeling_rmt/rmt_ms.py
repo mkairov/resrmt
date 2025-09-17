@@ -9,7 +9,7 @@ from accelerate.logging import get_logger
 logger = get_logger('')
 
 class MemoryLayerWrapper(nn.Module):
-    def __init__(self, layer, num_mem_tokens, memory_dim, res_mem_count=-1, embd_std=0.02, aggr_type='mem_attn', aggr_pos_embed='rope', **kwargs):
+    def __init__(self, layer, num_mem_tokens, memory_dim, res_mem_count=-1, embd_std=0.02, aggr_type='mem_attn', aggr_pos_embed='rope', is_first_layer=False, **kwargs):
         super().__init__()
         self.layer = layer
 
@@ -39,6 +39,7 @@ class MemoryLayerWrapper(nn.Module):
         elif aggr_pos_embed == 'none':
             self.pos_embed_func = lambda x, y: x
 
+        self.is_first_layer = is_first_layer
         self.generate_mode = False
         self.first_segment = True
         self.seg_num = 0
@@ -50,8 +51,8 @@ class MemoryLayerWrapper(nn.Module):
         # memory_weights = torch.zeros((num_mem_tokens, memory_dim))
         self.register_parameter('memory', torch.nn.Parameter(memory_weights, requires_grad=True))
 
-        # self.read_memory_position = range(num_mem_tokens)
-        # self.write_memory_position = range(-num_mem_tokens, 0)
+        self.read_memory_position = range(num_mem_tokens)
+        self.write_memory_position = range(-num_mem_tokens, 0)
 
     def set_memory(self, input_shape):
         memory = self.memory.repeat(input_shape[0], 1, 1)
@@ -81,6 +82,11 @@ class MemoryLayerWrapper(nn.Module):
                     self.first_segment = False
                 hidden_states = hidden_states[:, self.num_mem_tokens:]
                 hidden_states = torch.cat([self.memory_state, hidden_states], dim=1)
+
+            if not self.generate_mode:
+                if self.is_first_layer:
+                    hidden_states = hidden_states[:, :-self.num_mem_tokens]
+                    hidden_states = torch.cat([hidden_states, self.memory_state], dim=1)
         
         # logger.info(hidden_states.device)
         # logger.info(attention_mask.device)
@@ -129,6 +135,7 @@ class MemoryCell(nn.Module):
                 embd_std=embd_std,
                 aggr_type=aggr_type,
                 aggr_pos_embed=aggr_pos_embed,
+                is_first_layer=(i == 0),
                 **kwargs
             )
         

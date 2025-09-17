@@ -3,7 +3,7 @@
 set -e
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:2
 export CUDA_LAUNCH_BLOCKING=1
 NP=1
@@ -52,23 +52,23 @@ for MEMORY_SIZE in 4; do
 TBS=128
 INPUT_SIZE=2048
 
-# NUMS_PAIRSS=(5 0 10)
-# KEY_SIZES=(2 2 2)
-# VALUE_SIZES=(1 1 1)
-# BSS=(128 128 128)
-# ITERSS=(10000 10000 10000)
+NUMS_PAIRSS=(5 0 10)
+KEY_SIZES=(2 2 2)
+VALUE_SIZES=(1 1 1)
+BSS=(128 128 128)
+ITERSS=(10000 10000 10000)
 
 
-NUMS_PAIRSS=(5)
-KEY_SIZES=(2)
-VALUE_SIZES=(1)
-BSS=(128)
-ITERSS=(10000)
+# NUMS_PAIRSS=(5)
+# KEY_SIZES=(2)
+# VALUE_SIZES=(1)
+# BSS=(128)
+# ITERSS=(10000)
 
 DIM=128
 NUM_LAYERS=4
 
-for N in test_lr; do
+for N in ar_try1 ar_try2 ar_try3; do
 
 for (( j=0; j<${#NUMS_PAIRSS[@]}; j++ )); do
 
@@ -84,10 +84,10 @@ BLOCK_SIZE=$((KEY_SIZE + VALUE_SIZE + 2))
 cd base_models/gptconfigs
 python create_config.py --hidden_size $DIM --num_hidden_layers $NUM_LAYERS --num_attention_heads $NUM_LAYERS
 cd ../..
-# MODEL_CFG=/data/home/admin/rmt/base_models/gptconfigs/gpt2_tiny_${NUM_LAYERS}l${NUM_LAYERS}hd${DIM}.json
-MODEL_CFG=/data/home/admin/rmt/base_models/gptconfigs/neox_tiny_${NUM_LAYERS}l${NUM_LAYERS}hd${DIM}.json
+# MODEL_CFG=/home/mkairov/rmt/base_models/gptconfigs/gpt2_tiny_${NUM_LAYERS}l${NUM_LAYERS}hd${DIM}.json
+MODEL_CFG=/home/mkairov/rmt/base_models/gptconfigs/neox_tiny_${NUM_LAYERS}l${NUM_LAYERS}hd${DIM}.json
 
-for LR in 1e-3; do
+for LR in 3e-4; do
 
 K2=${MAX_N_SEGMENTS}
 
@@ -105,20 +105,19 @@ else
     REWRITE_FLAG=""
 fi
 
+MODEL_CPT=None
 if [[ $j -gt 0 ]]; then
     PREV_NUM_PAIRS=${NUMS_PAIRSS[j-1]}
     PREV_MAX_N_SEGMENTS=$((PREV_NUM_PAIRS + 1))
     if [[ $PREV_NUM_PAIRS -ne 0 ]]; then
-        MODEL_CPT=/data/home/admin/rmt/runs/${TASK_NAME}/${TASK_TYPE}/${MODEL_NAME}/${MODEL_KIND}/lr${LR}_${SCHEDULER}_adamw_wd1e-03_k${KEY_SIZES[j-1]}-v${VALUE_SIZES[j-1]}-p${PREV_NUM_PAIRS}-${PREV_MAX_N_SEGMENTS}x${INPUT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_${SEGMENT_ORDERING}_bptt-${PREV_MAX_N_SEGMENTS}_${NUM_LAYERS}l${NUM_LAYERS}hd${DIM}/run_$N 
+        MODEL_CPT=/home/mkairov/rmt/runs/${TASK_NAME}/${TASK_TYPE}/${MODEL_NAME}/${MODEL_KIND}/lr${LR}_${SCHEDULER}_adamw_wd1e-03_k${KEY_SIZES[j-1]}-v${VALUE_SIZES[j-1]}-p${PREV_NUM_PAIRS}-${PREV_MAX_N_SEGMENTS}x${INPUT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_${SEGMENT_ORDERING}_bptt-${PREV_MAX_N_SEGMENTS}_${NUM_LAYERS}l${NUM_LAYERS}hd${DIM}/run_$N 
     else
         MODEL_CPT=None
     fi
-else
-    MODEL_CPT=None
 fi
 
 GRAD_ACC_STEPS=$(($TBS/($BS*$NP)))
-ACCEL_CONFIG=/data/home/admin/rmt/accel_configs/exp/accelerate/deepspeed_bf16_tbs${TBS}bs${BS}g${GRAD_ACC_STEPS}c1.0np${NP}.yaml
+ACCEL_CONFIG=/home/mkairov/rmt/accel_configs/exp/accelerate/deepspeed_bf16_tbs${TBS}bs${BS}g${GRAD_ACC_STEPS}c1.0np${NP}.yaml
 cd accel_configs/
 python create_config.py \
         --bf16 \
@@ -130,7 +129,7 @@ python create_config.py \
         --prefix deepspeed
 cd ..
 
-MODEL_PATH="/data/home/admin/rmt/runs/${TASK_NAME}/${TASK_TYPE}/${MODEL_NAME}/${MODEL_KIND}/lr${LR}_${SCHEDULER}_adamw_wd1e-03_k${KEY_SIZE}-v${VALUE_SIZE}-p${NUM_PAIRS}-${MAX_N_SEGMENTS}x${INPUT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_${SEGMENT_ORDERING}_bptt-${K2}_${NUM_LAYERS}l${NUM_LAYERS}hd${DIM}/run_$N"
+MODEL_PATH="/home/mkairov/rmt/runs/${TASK_NAME}/${TASK_TYPE}/${MODEL_NAME}/${MODEL_KIND}/lr${LR}_${SCHEDULER}_adamw_wd1e-03_k${KEY_SIZE}-v${VALUE_SIZE}-p${NUM_PAIRS}-${MAX_N_SEGMENTS}x${INPUT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_${SEGMENT_ORDERING}_bptt-${K2}_${NUM_LAYERS}l${NUM_LAYERS}hd${DIM}/run_$N"
 
 if [[ ($OVERWRITE_RUNS -eq 1 || ! -d $MODEL_PATH) && $NUM_PAIRS -ne 0 ]]; then
 # if [ ($OVERWRITE_RUNS -eq 1 -o ! -d $MODEL_PATH) -a $NUM_PAIRS -ne 0 ]; then
@@ -139,7 +138,7 @@ echo gradient accumulation steps $GRAD_ACC_STEPS
 
 echo RUNNING: TASK_NAME TASK_TYPE MEMORY_SIZE KEY_SIZE VALUE_SIZE N_SEG  MODEL_NAME MODEL_CLS LR N
 echo RUNNING: $TASK_NAME $TASK_TYPE $MEMORY_SIZE $KEY_SIZE $VALUE_SIZE $MAX_N_SEGMENTS $MODEL_NAME $MODEL_CLS $LR $N
-accelerate launch --config_file $ACCEL_CONFIG --main_process_port 29228 run_finetuning_associative_retrieval.py \
+accelerate launch --config_file $ACCEL_CONFIG --main_process_port $((28000+$MODEL_KIND+$NUM_PAIRS+$N)) run_finetuning_associative_retrieval.py \
         --task_name $TASK_NAME \
         --model_path $MODEL_PATH \
         --model_cfg $MODEL_CFG \
@@ -167,7 +166,7 @@ accelerate launch --config_file $ACCEL_CONFIG --main_process_port 29228 run_fine
         --show_valid_examples 5 \
         --seed $(($N+42)) \
         --clip_grad_norm 1.0 \
-        --dataset_path /data/home/admin/rmt/datasets/associative_retrieval \
+        --dataset_path /home/mkairov/rmt/datasets/associative_retrieval \
         --layers_attr gpt_neox.layers \
         --train_size 100000 \
         --valid_size 1000 \

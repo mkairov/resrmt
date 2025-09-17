@@ -41,7 +41,7 @@ fi
 
 MODEL_NAME=gpt2  # backbone model
     
-ITERS=10000
+ITERS=1
 
 for TASK_DATASET in qa1_single-supporting-fact; do
 # for TASK_DATASET in qa2_two-supporting-facts; do
@@ -54,8 +54,8 @@ for LR in 1e-04; do
 
 TBS=64
 for SEGMENT_SIZE in 128; do
-MAX_N_SEGMENTSS=(0 0 2 0 0 3 0 0 4)
-BSS=(0 0 8 0 0 8 0 0 4)
+MAX_N_SEGMENTSS=(0 0 4)
+BSS=(0 0 4)
 
 for (( j=2; j<${#MAX_N_SEGMENTSS[@]}; j++ )); do
 
@@ -82,12 +82,12 @@ WEIGHT_DECAY=1e-02
 
 for RES_MEM_COUNT in 0; do
 
-for N in qa1_babi1 qa1_babi2 qa1_babi3; do
+for N in flops_profiling; do
 
 K2=-1 # BPTT unroll length
 
 NP=$NP  
-ACCEL_CONFIG=/home/mkairov/rmt/accel_configs/exp/accelerate/deepspeed_bf16_tbs${TBS}bs${BS}g${GRAD_ACC_STEPS}c1.0np${NP}.yaml
+ACCEL_CONFIG=/home/admin/rmt/accel_configs/exp/accelerate/deepspeed_bf16_tbs${TBS}bs${BS}g${GRAD_ACC_STEPS}c1.0np${NP}.yaml
 cd accel_configs/
 python create_config.py \
         --bf16 \
@@ -99,7 +99,7 @@ python create_config.py \
         --prefix deepspeed
 cd ..
 
-MODEL_PATH="/home/mkairov/rmt/runs/${TASK_DATASET}/${MODEL_NAME}/${MODEL_KIND}/lr${LR}_${SCHEDULER}_${OPTIMIZER}_wd${WEIGHT_DECAY}_${MAX_N_SEGMENTS}x${SEGMENT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_bptt-${K2}_from_cpt_${SRC_N_SEGMENTS}-${MAX_N_SEGMENTS}/run_${N}"
+MODEL_PATH="/home/admin/rmt/runs/${TASK_DATASET}/${MODEL_NAME}/${MODEL_KIND}/lr${LR}_${SCHEDULER}_${OPTIMIZER}_wd${WEIGHT_DECAY}_${MAX_N_SEGMENTS}x${SEGMENT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_bptt-${K2}_from_cpt_${SRC_N_SEGMENTS}-${MAX_N_SEGMENTS}/run_${N}"
 
 if [[ $OVERWRITE_RUNS -eq 1 || ! -f "${MODEL_PATH}/metrics.json" ]]; then
 # if [ ! -d $MODEL_PATH -o $OVERWRITE_RUNS -eq 1 ]; then
@@ -108,7 +108,7 @@ echo RUNNING: MODEL_KIND $MODEL_KIND TASK_DATASET $TASK_DATASET MEMORY_SIZE $MEM
 echo SAMPLE_SIZE $SAMPLE_SIZE MODEL_NAME $MODEL_NAME LR $LR N $N
 echo gradient accumulation steps $GRAD_ACC_STEPS
 
-MODEL_CPT="/home/mkairov/rmt/runs/${TASK_DATASET}/${MODEL_NAME}/${MODEL_KIND}/lr${LR}_${SCHEDULER}_${OPTIMIZER}_wd${WEIGHT_DECAY}_${SRC_N_SEGMENTS}x${SEGMENT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_bptt-${K2}_from_cpt_${SRC_SRC_N_SEGMENTS}-${SRC_N_SEGMENTS}/run_${N}/model_best"
+MODEL_CPT="/home/admin/rmt/runs/${TASK_DATASET}/${MODEL_NAME}/${MODEL_KIND}/lr${LR}_${SCHEDULER}_${OPTIMIZER}_wd${WEIGHT_DECAY}_${SRC_N_SEGMENTS}x${SEGMENT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_bptt-${K2}_from_cpt_${SRC_SRC_N_SEGMENTS}-${SRC_N_SEGMENTS}/run_${N}/model_best"
 
 if [ ! -d $MODEL_CPT ]; then
     echo checkpoint not found, training from scratch
@@ -121,7 +121,7 @@ fi
 accelerate launch --config_file $ACCEL_CONFIG --main_process_port 29002 run_finetuning_babilong_resrmt.py \
         --task_dataset $TASK_DATASET \
         --noise_dataset $NOISE_DATASET \
-        --babi_path /home/mkairov/rmt/data/tasks_1-20_v1-2/en-10k \
+        --babi_path /home/admin/rmt/data/tasks_1-20_v1-2/en-10k \
         --model_path $MODEL_PATH $MODEL_CPT \
         --from_pretrained $MODEL_NAME \
         --model_type $MODEL_TYPE \
@@ -140,7 +140,6 @@ accelerate launch --config_file $ACCEL_CONFIG --main_process_port 29002 run_fine
         --num_training_steps $((ITERS*2)) \
         --iters $ITERS \
         --reset_optimizer --reset_lr --reset_iteration \
-        --save_best \
         --k2 $K2 \
         --optimizer $OPTIMIZER --weight_decay $WEIGHT_DECAY \
         --lr ${LR} --lr_scheduler $SCHEDULER --num_warmup_steps $(($ITERS / 10)) \

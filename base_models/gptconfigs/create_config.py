@@ -2,7 +2,7 @@ import os
 import json
 import argparse
 
-save_folder = "/home/admin/rmt/base_models/gptconfigs/"
+save_folder = "/home/mkairov/rmt/base_models/gptconfigs/"
 default_config = {
   "architectures": [
     "GPTNeoXForCausalLM"

@@ -356,7 +356,7 @@ class AssociativeRecurrentWrapper(torch.nn.Module):
                                    labels_mask=labels_mask,
                                    output_attentions=output_attentions, 
                                    output_hidden_states=output_hidden_states)
-        return out
+        return out['logits']
 
     def segment(self, **kwargs):
         segments = []
