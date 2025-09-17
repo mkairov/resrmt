@@ -3,7 +3,7 @@
 set -e
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=2
 export CUBLAS_WORKSPACE_CONFIG=:4096:2
 export CUDA_LAUNCH_BLOCKING=1
 NP=1
@@ -14,9 +14,10 @@ MODEL_TYPE=decoder
 # BACKBONE_CLS=base_models.modeling_gpt_neox:GPTNeoXForCausalLM
 BACKBONE_CLS=transformers:AutoModelForCausalLM
 TASK_NAME=noisy_ar
-METRIC=exact_match
+METRIC=loss
 
 for MODEL_KIND in rmt4; do
+# for MODEL_KIND in rmt; do
 # for MODEL_KIND in rmt-br rmt-ms; do
 
 if [ $MODEL_KIND = "rmt" ]; then
@@ -25,10 +26,6 @@ if [ $MODEL_KIND = "rmt" ]; then
 elif [ $MODEL_KIND = "resrmt" ]; then
     MEMORY_CELL=modeling_rmt.resrmt:MemoryCell
     RECURRENT_WRAPPER=modeling_rmt.resrmt:RecurrentWrapper
-# elif [ $MODEL_KIND = "bwrmt" ]; then
-#     BACKBONE_CLS=modeling_rmt.block_resrmt:GPT2ModelWithBlockWiseMemory
-#     MEMORY_CELL="none --no_memory_cell"
-#     RECURRENT_WRAPPER=modeling_rmt.block_resrmt:RecurrentWrapper
 elif [ $MODEL_KIND = "rmt-br" ]; then
     MEMORY_CELL=modeling_rmt.rmt_br:MemoryCell
     RECURRENT_WRAPPER=modeling_rmt.rmt_br:RecurrentWrapper
@@ -50,7 +47,6 @@ else
 fi
 
 for RES_MEM_COUNT in 0; do
-for REWRITE in 0; do
 
 # MODEL_NAME=gpt-neox
 # MODEL_NAME=gpt2
@@ -59,7 +55,7 @@ MODEL_CFG=unsloth/Llama-3.2-1B
 for MEMORY_SIZE in 8; do
 
 TBS=64
-INPUT_SIZE=2048
+INPUT_SIZE=64
 
 # DIFFICULT EXPERIMENT
 
@@ -73,23 +69,46 @@ INPUT_SIZE=2048
 
 # SIMPLE EXPERIMENT
 
-NUMS_PAIRS=(1 2 2 2 2 10)
-KEY_SIZES=(4 4 4 4 4 2)
-VALUE_SIZES=(4 4 4 4 4 2)
-BSS=(64 64 64 64 64 64)
-MAX_N_SEGMENTSS=(1 1 2 4 4 4)
-MIN_SEGMENT_SIZES=(16 16 16 16 32 32)
-BLOCK_SIZES=(32 32 32 32 64 64)
-INNER_STEPSS=(2 2 2 2 3 3)
+NUMS_PAIRS=(1)
+KEY_SIZES=(4)
+VALUE_SIZES=(4)
+BSS=(64)
+MAX_N_SEGMENTSS=(1)
+MIN_SEGMENT_SIZES=(16)
+BLOCK_SIZES=(32)
+INNER_STEPSS=(3)
+
+# 2 SEGMENTS (MEMORY TEST)
+
+# NUMS_PAIRS=(2)
+# KEY_SIZES=(4)
+# VALUE_SIZES=(4)
+# BSS=(64)
+# MAX_N_SEGMENTSS=(2)
+# MIN_SEGMENT_SIZES=(16)
+# BLOCK_SIZES=(32)
+# INNER_STEPSS=(2)
+
+# CURRICULUM
+
+# NUMS_PAIRS=(1 2 2 2 2 10)
+# KEY_SIZES=(4 4 4 4 4 2)
+# VALUE_SIZES=(4 4 4 4 4 2)
+# BSS=(64 64 64 64 64 64)
+# MAX_N_SEGMENTSS=(1 1 2 4 4 4)
+# MIN_SEGMENT_SIZES=(16 16 16 16 32 32)
+# BLOCK_SIZES=(32 32 32 32 64 64)
+# INNER_STEPSS=(2 2 2 2 3 3)
 
 DIM=128
 NUM_LAYERS=4
 NUM_HEADS=4
 
-for N in noisy_ar_curr; do
+# for N in testttt; do
+for N in qqpp; do
 
-for (( j=0; j<${#NUMS_PAIRS[@]}; j++ ))
-do
+for (( j=0; j<${#NUMS_PAIRS[@]}; j++ )); do
+
 NUM_PAIRS=${NUMS_PAIRS[j]}
 KEY_SIZE=${KEY_SIZES[j]}
 VALUE_SIZE=${VALUE_SIZES[j]}
@@ -100,15 +119,7 @@ MIN_SEGMENT_SIZE=${MIN_SEGMENT_SIZES[j]}
 BLOCK_SIZE=${BLOCK_SIZES[j]}
 INNER_STEPS=${INNER_STEPSS[j]}
 
-ITERS=10000
-
-
-# cd base_models/gptconfigs
-# python create_config.py --hidden_size $DIM --num_hidden_layers $NUM_LAYERS --num_attention_heads $NUM_LAYERS
-# cd ../..
-# MODEL_CFG=/data/home/admin/rmt/base_models/gptconfigs/gpt2_tiny_${NUM_LAYERS}l${NUM_LAYERS}hd${DIM}.json
-# MODEL_CFG=/home/user36/resrmt/base_models/gptconfigs/neox_tiny_${NUM_LAYERS}l${NUM_LAYERS}hd${DIM}.json
-
+ITERS=200000
 for LR in 1e-04; do
 
 K2=${MAX_N_SEGMENTS}
@@ -117,27 +128,17 @@ K2=${MAX_N_SEGMENTS}
 # for SCHEDULER in linear; do
 for SCHEDULER in constant_with_warmup; do
 
-if [ $REWRITE -eq 1 ]; then
-    echo retrieval with key overwriting
-    TASK_TYPE=rewrite
-    REWRITE_FLAG="--rewrite_setting"
-else
-    echo retrieval with unique pairs
-    TASK_TYPE=remember
-    REWRITE_FLAG=""
-fi
-
 if [[ j -gt 0 ]]
 then
     PREV_NUM_PAIRS=${NUMS_PAIRS[j-1]}
     PREV_MAX_N_SEGMENTS=$((PREV_NUM_PAIRS + 1))
-    MODEL_CPT=../runs/${TASK_NAME}/${TASK_TYPE}/${MODEL_NAME}/${MODEL_KIND}/lr${LR}_${SCHEDULER}_adamw_wd1e-03_k${KEY_SIZES[j-1]}-v${VALUE_SIZES[j-1]}-p${PREV_NUM_PAIRS}-${PREV_MAX_N_SEGMENTS}x${INPUT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_bptt-${PREV_MAX_N_SEGMENTS}_${NUM_LAYERS}l${NUM_LAYERS}hd${DIM}/run_$N 
+    MODEL_CPT=../runs/${TASK_NAME}/${MODEL_NAME}/${MODEL_KIND}/lr${LR}_${SCHEDULER}_adamw_wd1e-03_k${KEY_SIZES[j-1]}-v${VALUE_SIZES[j-1]}-p${PREV_NUM_PAIRS}-${PREV_MAX_N_SEGMENTS}x${INPUT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_bptt-${K2}_${NUM_LAYERS}l${NUM_LAYERS}hd${DIM}/run_$N 
 else
     MODEL_CPT=None
 fi
 
 GRAD_ACC_STEPS=$(($TBS/($BS*$NP)))
-ACCEL_CONFIG=/home/admin/rmt/accel_configs/exp/accelerate/deepspeed_bf16_tbs${TBS}bs${BS}g${GRAD_ACC_STEPS}c1.0np${NP}.yaml
+ACCEL_CONFIG=/home/mkairov/rmt/accel_configs/exp/accelerate/deepspeed_bf16_tbs${TBS}bs${BS}g${GRAD_ACC_STEPS}c1.0np${NP}.yaml
 cd accel_configs/
 python create_config.py \
         --bf16 \
@@ -149,15 +150,15 @@ python create_config.py \
         --prefix deepspeed
 cd ..
 
-MODEL_PATH="/home/admin/rmt/runs/${TASK_NAME}/${TASK_TYPE}/${MODEL_NAME}/${MODEL_KIND}/lr${LR}_${SCHEDULER}_adamw_wd1e-03_k${KEY_SIZE}-v${VALUE_SIZE}-p${NUM_PAIRS}-${MAX_N_SEGMENTS}x${INPUT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_bptt-${K2}_${NUM_LAYERS}l${NUM_LAYERS}hd${DIM}/run_$N"
+MODEL_PATH="/home/mkairov/rmt/runs/${TASK_NAME}/${MODEL_NAME}/${MODEL_KIND}/lr${LR}_${SCHEDULER}_adamw_wd1e-03_k${KEY_SIZE}-v${VALUE_SIZE}-p${NUM_PAIRS}-${MAX_N_SEGMENTS}x${INPUT_SIZE}_mem${MEMORY_SIZE}_resmem${RES_MEM_COUNT}_bs${TBS}_bptt-${K2}_${NUM_LAYERS}l${NUM_LAYERS}hd${DIM}/run_$N"
 
 if [ $OVERWRITE_RUNS -eq 1 -o ! -d $MODEL_PATH ]; then
 
 echo gradient accumulation steps $GRAD_ACC_STEPS
 
-echo RUNNING: TASK_NAME TASK_TYPE MEMORY_SIZE KEY_SIZE VALUE_SIZE N_SEG  MODEL_NAME MODEL_CLS LR N
-echo RUNNING: $TASK_NAME $TASK_TYPE $MEMORY_SIZE $KEY_SIZE $VALUE_SIZE $MAX_N_SEGMENTS $MODEL_NAME $MODEL_CLS $LR $N
-accelerate launch --config_file $ACCEL_CONFIG --main_process_port 21401 run_finetuning_noisy_ar.py \
+echo RUNNING: TASK_NAME MEMORY_SIZE KEY_SIZE VALUE_SIZE N_SEG  MODEL_NAME MODEL_CLS LR N
+echo RUNNING: $TASK_NAME $MEMORY_SIZE $KEY_SIZE $VALUE_SIZE $MAX_N_SEGMENTS $MODEL_NAME $MODEL_CLS $LR $N
+accelerate launch --config_file $ACCEL_CONFIG --main_process_port $((29503+$TBS)) run_finetuning_noisy_ar.py \
         --task_name $TASK_NAME \
         --model_path $MODEL_PATH \
         --model_cfg $MODEL_CFG \
@@ -181,18 +182,18 @@ accelerate launch --config_file $ACCEL_CONFIG --main_process_port 21401 run_fine
         --lr ${LR} --lr_scheduler $SCHEDULER --num_warmup_steps 1000 \
         --data_n_workers 2 \
         --log_interval 100 --valid_interval 500 \
-        --optimize_metric $METRIC --optimize_mode max --best_metric_value 1.0 \
+        --optimize_metric $METRIC --optimize_mode min --best_metric_value 0.0 \
         --show_valid_examples 5 \
         --seed $(($N+42)) \
         --clip_grad_norm 1.0 \
-        --dataset_path /home/admin/rmt/datasets/associative_retrieval \
+        --dataset_path /home/mkairov/rmt/datasets/associative_retrieval \
         --layers_attr model.layers \
         --train_size 100000 \
         --valid_size 1000 \
         --test_size 10000 \
         --aggr_type full \
-        --init_inner_lr 1.0 --init_stability_coef 0.1 --inner_steps $INNER_STEPS \
-        --res_mem_count $RES_MEM_COUNT $REWRITE_FLAG \
+        --init_inner_lr 2.5 --inner_steps $INNER_STEPS --inner_clip_norm 1.0 \
+        --res_mem_count $RES_MEM_COUNT \
         --reset_optimizer --reset_lr \
         --save_best \
         --model_cpt $MODEL_CPT
@@ -208,7 +209,6 @@ else
 echo run $MODEL_PATH exists already, with OVERWRITE set to 1
 fi
 
-done
 done
 done
 done
