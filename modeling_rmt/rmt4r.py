@@ -11,12 +11,16 @@ logger = get_logger('')
 
 
 class MemoryCell(torch.nn.Module):
-    def __init__(self, base_model, num_mem_tokens, init_inner_lr=1.0, learn_lr=False, inner_steps=10, **kwargs):
+    def __init__(self, base_model, num_mem_tokens, init_inner_lr=1.0, learn_lr=False, inner_steps=10, inner_optim='sgd', **kwargs):
         super().__init__()
         self.model = base_model
         self.create_memory(num_mem_tokens)
 
+        self.num_mem_tokens = num_mem_tokens
         self.inner_steps = inner_steps
+        self.inner_optim = inner_optim
+        assert self.inner_optim != 'muon' or self.num_mem_tokens > 1, "Muon works with 2+ memory tokens only"
+
         self.inner_clip_value = kwargs.get('inner_clip_value', None)
         self.inner_clip_norm = kwargs.get('inner_clip_norm', None)
         self.use_write_head = kwargs.get('use_write_head', None)
@@ -41,7 +45,6 @@ class MemoryCell(torch.nn.Module):
         self.mem_list = []
 
     def create_memory(self, num_mem_tokens):
-        self.num_mem_tokens = num_mem_tokens
         embeddings = self.model.get_input_embeddings()
         memory_dim =  getattr(self.model.config, 'n_embd', self.model.config.hidden_size)
         memory_weights = torch.randn((num_mem_tokens, memory_dim)) * embeddings.weight.data.std()
@@ -68,15 +71,52 @@ class MemoryCell(torch.nn.Module):
         inner_lr = torch.exp(self.log_inner_lr)
         return p - inner_lr * g
 
+    @staticmethod
+    def _zeropower_via_newtonschulz5(g, steps: int):
+        assert g.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
+        a, b, c = (3.4445, -4.7750,  2.0315)
+        X = g.bfloat16()
+        if g.size(-2) > g.size(-1):
+            X = X.mT
+
+        # Ensure spectral norm is at most 1
+        X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+        # Perform the NS iterations
+        for _ in range(steps):
+            A = X @ X.mT
+            B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+            X = a * X + B @ X
+        
+        if g.size(-2) > g.size(-1):
+            X = X.mT
+        return X
+    
+    def _muon_step(self, p, g, clip_value=None, clip_norm=None, ns_steps=5):
+        if clip_value is not None:
+            # simple element-wise clamp
+            g = torch.clamp(g, -clip_value, clip_value)
+
+        if clip_norm is not None:
+            # scale gradient if its 2-norm is too large
+            # check grad for each sample separately as we do per-sample optimization
+            g_norm = g.norm(dim=[1, 2], keepdim=True)                 # (B,1,1)
+            scale = clip_norm / (g_norm + 1e-6)
+            g = torch.where(g_norm > clip_norm, g * scale, g)
+        
+        update = self._zeropower_via_newtonschulz5(g, steps=ns_steps)
+        update *= max(1, g.size(-2) / g.size(-1))**0.5
+
+        inner_lr = torch.exp(self.log_inner_lr)
+        return p - inner_lr * update
+
     @torch.enable_grad()
     def inner_loop(self, input_ids, **seg_kwargs):
         seg_kwargs = copy(seg_kwargs)
         inputs_embeds = seg_kwargs['inputs_embeds']
         B = inputs_embeds.size(0)
-        memory_state = inputs_embeds[:, :self.num_mem_tokens]
+        mem_live = inputs_embeds[:, :self.num_mem_tokens]
+        mem_live = mem_live.requires_grad_(True)
         orig_embeds = inputs_embeds[:, self.num_mem_tokens:]
-
-        mem_live = memory_state.requires_grad_(True)
 
         device = inputs_embeds.device
         inner_loop_stats = {'inner_grad_norm_mean': torch.tensor(0.0, device=device)}
@@ -90,23 +130,36 @@ class MemoryCell(torch.nn.Module):
                 h = out.hidden_states[-1]
                 h = h[:, self.num_mem_tokens:, :]
                 logits = self.write_head(h)
+                del h
             else:
                 logits = out.logits
                 logits = logits[:, self.num_mem_tokens:, :]
             
-            inner_loss = F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)), input_ids[:, 1:].reshape(-1),)
+            inner_loss = F.cross_entropy(
+                logits[:, :-1].reshape(-1, logits.size(-1)),
+                input_ids[:, 1:].reshape(-1),
+                reduction='none'
+            ).view(B, -1)
+            inner_loss = (inner_loss.sum(1) / inner_loss.size(1)).sum()
+            del logits
+
             g = torch.autograd.grad(inner_loss, mem_live, create_graph=True)[0]
             g_norm = g.reshape(B, -1).norm(dim=1).detach()
 
             inner_loop_stats['inner_grad_norm_mean'] += g_norm.mean()
-            mem_live = self._sgd_step(mem_live, g, clip_value=self.inner_clip_value, clip_norm=self.inner_clip_norm)
 
-        self.prev_g = g.detach()
+            if self.inner_optim == 'sgd':
+                mem_live = self._sgd_step(mem_live, g, clip_value=self.inner_clip_value, clip_norm=self.inner_clip_norm)
+            elif self.inner_optim == 'muon':
+                mem_live = self._muon_step(mem_live, g, clip_value=self.inner_clip_value, clip_norm=self.inner_clip_norm)
+            else:
+                raise "Unknown optimizer for inner loop"
 
         mem_norm = mem_live.norm(dim=[1, 2]).detach()  # B
         inner_loop_stats['inner_mem_norm_mean'] = mem_norm.mean()
         inner_loop_stats['inner_grad_norm_mean'] /= self.inner_steps
-        inner_loop_stats['inner_final_loss'] = inner_loss
+        inner_loop_stats['inner_final_loss'] = inner_loss.detach() / B
+        del inner_loss
 
         return out, mem_live, inner_loop_stats
 
@@ -199,7 +252,6 @@ class RecurrentWrapper(torch.nn.Module):
         self.memory_cell.mem_list.clear()
 
         cell_outputs = []
-        # print('\n\n\nForward: ', [s['input_ids'].shape for s in segmented])
         for seg_num, segment in enumerate(segmented):
             is_last_segment = seg_num == len(segmented) - 1
             cell_out, memory_state = self.memory_cell(**segment, memory_state=memory_state, is_last_segment=is_last_segment, output_hidden_states=True)
@@ -215,10 +267,10 @@ class RecurrentWrapper(torch.nn.Module):
     def generate(self, input_ids, attention_mask=None, **generate_kwargs):
         memory_state = None
         segmented = self.segment(input_ids=input_ids, attention_mask=attention_mask)
+        self.memory_cell.mem_list.clear()
 
-        # print('\n\n\nGenerate: ', [s['input_ids'].shape for s in segmented])
-        for seg_num, segment in enumerate(segmented[:-1]):
-            cell_out, memory_state = self.memory_cell(**segment, memory_state=memory_state, output_hidden_states=True)
+        for _, segment in enumerate(segmented[:-1]):
+            _, memory_state = self.memory_cell(**segment, memory_state=memory_state, output_hidden_states=True)
 
         final_segment = segmented[-1]
         out = self.memory_cell.generate(**final_segment, memory_state=memory_state, is_last_segment=True, **generate_kwargs)
@@ -274,9 +326,6 @@ class RecurrentWrapper(torch.nn.Module):
                 flat_labels = flat_labels[shift_mask.view(-1)]
                 flat_logits = flat_logits[shift_mask.view(-1)]
 
-                # print(flat_labels)
-                # print(flat_logits.argmax(dim=-1))
-     
             out['loss'] = loss_fct(flat_logits, flat_labels)
             if out['loss'] is None:
                 raise ValueError
@@ -296,8 +345,6 @@ class RecurrentWrapper(torch.nn.Module):
                 if any([sk in key for sk in segment_keys]):
                     out[f'{key}_{seg_num}'] = value
         
-        out['inner_lr'] = torch.exp(self.memory_cell.log_inner_lr).item()
-
         return out 
         
     def manage_gradients(self, memory_state, seg_num):
