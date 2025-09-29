@@ -39,8 +39,6 @@ import lm_experiments_tools.optimizers as optimizers  # noqa: E402
 # all gpus set with CUDA_VISIBLE_DEVICES are visible to process, indexing from 0 to ...
 
 parser = HfArgumentParser(TrainerArgs)
-parser.add_argument('--task_name', type=str, help='Scrolls task name: "gov_report", "summ_screen_fd", "qmsum", '
-                                                  '"narrative_qa", "qasper", "quality", "contract_nli"')
 
 parser.add_argument('--report_to', type=str, default='wandb', help='')
 parser.add_argument('--validate_only', action='store_true', default=False,
@@ -53,14 +51,8 @@ parser.add_argument('--working_dir', type=str, default='.',
 parser.add_argument('--seed', type=int, default=42, help='random seed')
 parser.add_argument('--show_valid_examples', type=int, default=0,
                     help='how many valid examples to show during training (default: 0)')
-# parser.add_argument('--input_seq_len', type=int, default=128, help='input sequnce length (default: 128).')
-# parser.add_argument('--target_seq_len', type=int, default=16, help='target sequnce length, should be set to '
-                                                                #    'max(len(target))+1 for EOS (default: 16).')
 parser.add_argument('--data_n_workers', type=int, default=2, help='number of dataloader workers (default: 2)')
 
-parser.add_argument('--input_prefix', type=str, default='', help='add task prefix to an input string (default: "")')
-parser.add_argument('--sliding_window', action='store_true', help='use slinding window attention mask, '
-                    'eval on last segment only', default=False)
 
 # model args
 parser.add_argument('--from_pretrained', type=str, help='model name in HF Model Hub (default: "")')
@@ -70,12 +62,13 @@ parser.add_argument('--model_cls', type=str, default='transformers:BertForPreTra
 parser.add_argument('--memory_cell_cls', type=str, default=None, help='cell class for RMT')
 parser.add_argument('--recurrent_wrapper_cls', type=str, default=None, help='recurrent wrapper class for RMT')
 parser.add_argument('--model_cpt', type=str, default=None, help='pretrained model checkpoint path')
-parser.add_argument('--model_type', type=str, default='encoder-decoder',
+parser.add_argument('--model_type', type=str, default='decoder',
                     help='model type, encoder, encoder-decoder, decoder, affects preprocessing '
                          '(default: encoder-decoder)')
 parser.add_argument('--layers_attr', type=str, default=None, help='attribute of model, which contains layers')
 
 # Dataset args
+parser.add_argument('--vocab_size', type=int, default=59, help='number of possible symbols in keys and values')
 parser.add_argument('--key_size', type=int, default=None, help='number of digits in keys')
 parser.add_argument('--value_size', type=int, default=None, help='number of digits in values')
 parser.add_argument('--num_pairs', type=int, default=None, help='number of key-value pairs in sample')
@@ -116,16 +109,13 @@ parser.add_argument('--use_mem_attn', action='store_true', default=False, help='
 parser.add_argument('--use_agem', action='store_true', default=False, help='use A-GEM for memory updates')
 parser.add_argument('--use_ogd', action='store_true', default=False, help='use OGD for memory updates')
 parser.add_argument('--use_write_head', action='store_true', default=False, help='use write head for memory')
-
+parser.add_argument('--inner_optim', type=str, default='sgd', help='optimizer for inner loop updates')
+parser.add_argument('--momentum_mode', type=str, default=None, help='mode for Momentum in inner loop')
 
 # Backnone args
-parser.add_argument('--hidden_dim', type=int, default=128, help='size of hidden states in backbone model')
-parser.add_argument('--n_head', type=int, default=4, help='number of heads in backbone model')
-parser.add_argument('--n_layer', type=int, default=4, help='number of layers in backbone model')
-
-# tokenizer
-# todo: add wordpiece tokenizers support?
-parser.add_argument('--tokenizer', type=str, default=None, help='path or name of pre-trained HF Tokenizer')
+parser.add_argument('--model_hidden', type=int, default=128, help='size of hidden states in backbone model')
+parser.add_argument('--model_heads', type=int, default=4, help='number of heads in backbone model')
+parser.add_argument('--model_layers', type=int, default=4, help='number of layers in backbone model')
 
 # optimizer args
 parser.add_argument('--optimizer', type=str, default='AdamW', help='optimizer name: AdamW, Adafactor. (default: AdamW)')
@@ -138,7 +128,6 @@ parser.add_argument('--warmup_init', action='store_true', default=False,
                     help='Adafactor warmup_init (default: False)')
 
 
-NUM_SYMBOLS = 16
 if __name__ == '__main__':
     args = parser.parse_args()
     if args.num_test_pairs is None:
@@ -161,14 +150,13 @@ if __name__ == '__main__':
     prepare_run(args, logger, logger_fmt)
 
     block_size = args.segment_size
+    NUM_SYMBOLS = args.vocab_size
     sep_token, gen_token, eos_token = NUM_SYMBOLS, NUM_SYMBOLS+1, NUM_SYMBOLS+2
 
     collate_fn = partial(ar_collate_fn, vary_n_segments=args.vary_n_segments, rewrite_setting=args.rewrite_setting,
                             sep_token=sep_token, gen_token=gen_token, eos_token=eos_token, value_size=args.value_size)
 
     kwargs = {'pin_memory': True, 'num_workers': args.data_n_workers}
-    # get train dataset
-    logger.info(f'preparing dataset for: {args.task_name}')
     
     dataset_name = f"AR_k{args.key_size}_v{args.value_size}_p{args.num_pairs}_valp{args.num_test_pairs}"
     
@@ -217,25 +205,20 @@ if __name__ == '__main__':
     logger.info(f'Using model class: {model_cls}')
     if not args.from_pretrained:
         config = AutoConfig.from_pretrained(args.model_cfg)
-        config.num_hidden_layers = args.n_layer
-        config.num_attention_heads = args.n_head
-        config.num_key_value_heads = args.n_head
-        config.hidden_size = args.hidden_dim
-        config.head_dim = config.hidden_size // config.num_attention_heads
-        config.intermediate_size = config.hidden_size * 4
+        config.num_hidden_layers = args.model_layers
+        config.num_attention_heads = args.model_heads
+        config.num_key_value_heads = args.model_heads
+        config.hidden_size = args.model_hidden
+        config.head_dim = args.model_hidden // config.num_attention_heads
+        config.intermediate_size = args.model_hidden * 4
         config.vocab_size = NUM_SYMBOLS + 3
         config.pad_token_id = NUM_SYMBOLS + 2
-        # config.pad_token_id = tokenizer.convert_tokens_to_ids("|")
 
         model = model_cls.from_config(config=config)
-        # model = model_cls(config=model_cfg)
     else:
         logger.info(f'Loading pretrained model: {args.from_pretrained}')
         model = model_cls.from_pretrained(args.from_pretrained)
 
-    # ## add [GEN] token
-    # model.resize_token_embeddings(len(tokenizer))
-    
     ## load cpt of backbone model
     if args.backbone_cpt:
         backbone_cpt = os.path.join(args.backbone_cpt, "model_best.pth")
@@ -243,17 +226,15 @@ if __name__ == '__main__':
         model.load_state_dict(cpt['model_state_dict'])
         logger.info(f'Loaded baseline state dict from: {args.backbone_cpt}')
 
-        
+
     memory_cell_cls = get_cls_by_name(args.memory_cell_cls)
     recurrent_wrapper_cls = get_cls_by_name(args.recurrent_wrapper_cls)
     logger.info(f'Wrapping in: {memory_cell_cls} and {recurrent_wrapper_cls}')
     
-    
     mem_cell_args = dict(
         base_model=model,
+        max_n_segments=args.max_n_segments
     )
-    if args.d_mem is not None:
-        mem_cell_args['d_mem'] = args.d_mem
 
     if args.num_mem_tokens is not None:
         mem_cell_args['num_mem_tokens'] = args.num_mem_tokens
@@ -266,23 +247,26 @@ if __name__ == '__main__':
     if args.res_mem_count is not None:
         mem_cell_args["res_mem_count"] = args.res_mem_count
 
-    if args.inner_steps:
+    if args.inner_steps is not None:
         mem_cell_args['inner_steps'] = args.inner_steps
-    if args.init_inner_lr:
+    if args.init_inner_lr is not None:
         mem_cell_args['init_inner_lr'] = args.init_inner_lr
     if args.learn_lr:
         mem_cell_args['learn_lr'] = True
-    if args.inner_clip_value:
+    if args.inner_clip_value is not None:
         mem_cell_args['inner_clip_value'] = args.inner_clip_value
-    if args.inner_clip_norm:
+    if args.inner_clip_norm is not None:
         mem_cell_args['inner_clip_norm'] = args.inner_clip_norm
+    if args.momentum_mode is not None:
+        mem_cell_args['momentum_mode'] = args.momentum_mode
 
+    if args.d_mem is not None:
+        mem_cell_args['d_mem'] = args.d_mem
     if args.no_correction:
         mem_cell_args['correction'] = False
-    mem_cell_args['use_mem_attn'] = args.use_mem_attn
-    mem_cell_args['use_agem'] = args.use_agem
-    mem_cell_args['use_ogd'] = args.use_ogd
+
     mem_cell_args['use_write_head'] = args.use_write_head
+    mem_cell_args['inner_optim'] = args.inner_optim
 
     cell = memory_cell_cls(**mem_cell_args)
     model = recurrent_wrapper_cls(
@@ -294,7 +278,6 @@ if __name__ == '__main__':
         res_mem_count=args.res_mem_count
     )
                                     
-
         ## load cpt of rmt
     if args.model_cpt and args.model_cpt != 'None':
         model_cpt = os.path.join(args.model_cpt, "model_best/model.pth")
